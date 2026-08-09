@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarmforge"
+version = "0.2.0"
+description = "Route one task across every free AI coding agent on your machine. No API keys, zero dependencies."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+keywords = ["ai", "agents", "orchestrator", "cli", "multi-agent", "llm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+swarmforge = "swarmforge:main"
+
+[tool.setuptools]
+packages = ["swarmforge"]

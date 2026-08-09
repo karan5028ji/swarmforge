@@ -51,6 +51,8 @@ a shared context — one prompt in, multiple agents build, review, and fix in pa
 
 ## Quick start
 
+You can run it straight from the repo (a `forge.py` shim keeps the old entry point working):
+
 ```bash
 git clone <your-repo-url> && cd SwarmForge
 
@@ -64,7 +66,15 @@ python forge.py "Build me a todo web app"
 python forge.py --install
 ```
 
-That's it. A workspace folder (`runs/<task>-<timestamp>/`) is created with:
+Or install it as a real package and get the `swarmforge` command everywhere:
+
+```bash
+pip install -e .
+swarmforge --check
+swarmforge "Build me a todo web app"
+```
+
+Either way a workspace folder (`runs/<task>-<timestamp>/`) is created with:
 `memory/` (shared context + logs), `out/` (each agent's files), and `REPORT.md` (final summary).
 
 ## Usage
@@ -91,9 +101,17 @@ python forge.py "..." --dry-run
 # Choose where the workspace goes
 python forge.py "..." --dir my-workspace
 
+# Resume an existing workspace: re-review its outputs and re-report
+python forge.py --continue --dir my-workspace
+
+# Live web dashboard while a run is happening
+python forge.py "..." --dir my-workspace --serve
+
 # Tune execution
 python forge.py "..." --timeout 1800 --max-parallel 6
 ```
+
+> The `forge.py` shim and the installed `swarmforge` command accept exactly the same flags.
 
 ## Supported agents (auto-detected)
 
@@ -140,10 +158,14 @@ Everything is configurable: which tools exist, their commands, approval flags, a
 
 | Role | Job | Picked from |
 |------|-----|-------------|
-| planner | Split the task into 2–6 independent subtasks (returns JSON) | first available planner-capable tool |
+| planner | Split the task into 2–6 subtasks, returning a **DAG** (a `depends` field when one subtask needs another) | first available planner-capable tool |
 | coder | Build one subtask inside its own `out/<id>/` folder | round-robin across coder-capable tools |
 | reviewer | Inspect all outputs, return JSON list of issues | a *different* tool than the coders when possible |
 | fixer | Apply the reviewer's fixes | round-robin across fixer-capable tools |
+
+Dependencies are respected: subtasks with no `depends` run in parallel; a subtask that
+`depends` on another waits until its dependency finished (its outputs are passed along
+in `DEPENDENCY OUTPUTS`).
 
 The review/fix loop runs up to 2 rounds and stops as soon as a review is clean.
 
@@ -151,10 +173,15 @@ The review/fix loop runs up to 2 rounds and stops as soon as a review is clean.
 
 ```
 SwarmForge/
-├── forge.py                # the whole orchestrator (stdlib only)
+├── swarmforge/             # the package (pip install -e . for the `swarmforge` command)
+│   ├── __init__.py         # the whole orchestrator (stdlib only)
+│   └── __main__.py         # enables `python -m swarmforge`
+├── forge.py                # tiny shim -> swarmforge (backward-compatible)
 ├── agents.json             # tool + role configuration
+├── pyproject.toml          # packaging metadata (setuptools)
 ├── setup.ps1 / setup.sh    # optional install helpers (Windows / macOS+Linux)
 ├── tests/
+│   ├── test_forge.py       # unit + end-to-end tests (mock-based)
 │   ├── mock_agent.py       # fake AI CLI for end-to-end testing
 │   └── test-config.json    # mock-only config (no real tools needed)
 ├── examples/sample-task.txt
@@ -166,6 +193,10 @@ SwarmForge/
 SwarmForge ships with mock agents so you can verify the full pipeline without any real AI tool:
 
 ```bash
+# whole suite
+python -m unittest discover tests -v
+
+# or a single end-to-end run
 python forge.py "Build a todo web app" --config tests/test-config.json --dir runs/_e2e
 ```
 
@@ -178,7 +209,7 @@ python forge.py "Build a todo web app" --config tests/test-config.json --dir run
 
 ## Roadmap
 
-- [ ] Dependency-aware plan (DAG instead of "all parallel")
+- [x] Dependency-aware plan (DAG instead of "all parallel")
 - [ ] `--model` CLI override per role
 - [ ] Token/quota usage dashboard
 - [ ] Auto-init of a fresh project scaffold for the whole swarm
