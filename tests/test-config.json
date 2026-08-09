@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "defaults": {
+    "timeout": 60,
+    "max_parallel": 4
+  },
+  "providers": {
+    "mocka": {
+      "always_available": true,
+      "command": ["python", "{ROOT}/mock_agent.py", "mocka"],
+      "roles": ["planner", "coder", "reviewer", "fixer"]
+    },
+    "mockb": {
+      "always_available": true,
+      "command": ["python", "{ROOT}/mock_agent.py", "mockb"],
+      "roles": ["coder", "reviewer"]
+    }
+  },
+  "roles": {
+    "planner": { "providers": ["mocka"] },
+    "coder": { "providers": ["mocka", "mockb"] },
+    "reviewer": { "providers": ["mockb"] },
+    "fixer": { "providers": ["mocka"] }
+  }
+}

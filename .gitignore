@@ -1,0 +1,24 @@
+# SwarmForge — generated at runtime
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Secrets
+.env
+*.local

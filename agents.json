@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "defaults": {
+    "timeout": 900,
+    "max_parallel": 4
+  },
+  "providers": {
+    "opencode": {
+      "binary": "opencode",
+      "command": ["opencode", "run"],
+      "model_flag": ["--model"],
+      "approve_flags": ["--auto"],
+      "install": {
+        "npm": "npm i -g opencode-ai",
+        "curl": "curl -fsSL https://opencode.ai/install | bash"
+      },
+      "roles": ["planner", "coder", "reviewer", "fixer"]
+    },
+    "agy": {
+      "binary": "agy",
+      "command": ["agy", "-p"],
+      "model_flag": ["--model"],
+      "approve_flags": ["--dangerously-skip-permissions"],
+      "install": {
+        "curl": "curl -fsSL https://antigravity.google/cli/install.sh | bash"
+      },
+      "roles": ["planner", "coder", "fixer"]
+    },
+    "gemini": {
+      "binary": "gemini",
+      "command": ["gemini", "-p"],
+      "model_flag": ["--model"],
+      "approve_flags": ["--yolo"],
+      "install": {
+        "npm": "npm i -g @google/gemini-cli"
+      },
+      "roles": ["coder", "reviewer"]
+    },
+    "grok": {
+      "binary": "grok",
+      "command": ["grok", "-p"],
+      "model_flag": ["-m"],
+      "approve_flags": ["--always-approve", "--no-auto-update"],
+      "install": {
+        "curl": "curl -fsSL https://x.ai/cli/install.sh | bash"
+      },
+      "roles": ["planner", "coder", "reviewer"]
+    },
+    "copilot": {
+      "binary": "copilot",
+      "command": ["copilot", "-p"],
+      "model_flag": [],
+      "approve_flags": ["--yolo", "--no-ask-user"],
+      "install": {
+        "npm": "npm i -g @github/copilot"
+      },
+      "roles": ["coder", "fixer"]
+    }
+  },
+  "roles": {
+    "planner": { "providers": ["opencode", "grok", "agy"] },
+    "coder": { "providers": ["opencode", "grok", "agy", "gemini", "copilot"] },
+    "reviewer": { "providers": ["grok", "opencode", "gemini"] },
+    "fixer": { "providers": ["opencode", "agy", "copilot"] }
+  }
+}

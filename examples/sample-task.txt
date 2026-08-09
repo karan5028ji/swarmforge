@@ -1,0 +1,5 @@
+Build a small task-manager web app with:
+- a Python backend (FastAPI) exposing CRUD REST endpoints for tasks
+- a frontend (plain HTML + JS) to create, list, complete and delete tasks
+- data stored in a simple SQLite database
+- a README explaining how to run it
