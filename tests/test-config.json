@@ -8,7 +8,7 @@
     "mocka": {
       "always_available": true,
       "command": ["python", "{ROOT}/mock_agent.py", "mocka"],
-      "roles": ["planner", "coder", "reviewer", "fixer"]
+      "roles": ["planner", "scaffolder", "coder", "reviewer", "fixer"]
     },
     "mockb": {
       "always_available": true,
@@ -18,6 +18,7 @@
   },
   "roles": {
     "planner": { "providers": ["mocka"] },
+    "scaffolder": { "providers": ["mocka"] },
     "coder": { "providers": ["mocka", "mockb"] },
     "reviewer": { "providers": ["mockb"] },
     "fixer": { "providers": ["mocka"] }

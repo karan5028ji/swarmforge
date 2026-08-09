@@ -104,6 +104,15 @@ python forge.py "..." --dir my-workspace
 # Resume an existing workspace: re-review its outputs and re-report
 python forge.py --continue --dir my-workspace
 
+# Bootstrap a shared project tree first; all subtasks build inside it
+python forge.py "Build a CLI tool" --scaffold
+
+# Override the model for specific roles (repeatable)
+python forge.py "..." --model coder=grok-3-mini --model reviewer=gemini-2.5-pro
+
+# Token-usage dashboard (global ledger, quota-aware)
+swarmforge --stats
+
 # Live web dashboard while a run is happening
 python forge.py "..." --dir my-workspace --serve
 
@@ -113,14 +122,35 @@ python forge.py "..." --timeout 1800 --max-parallel 6
 
 > The `forge.py` shim and the installed `swarmforge` command accept exactly the same flags.
 
+## Usage ledger & quotas
+
+Every run records estimated token/time usage per provider into a **global ledger**
+(`%APPDATA%\swarmforge\usage.json` on Windows, `~/.config/swarmforge/usage.json` elsewhere;
+override with `"defaults": { "usage_file": "..." }` in the config).
+
+- `swarmforge --stats` prints a dashboard: runs, est. tokens, today's tokens, and quota status.
+- A provider can declare a daily token cap:
+
+```jsonc
+"providers": {
+  "grok": {
+    "command": ["grok", "-p"],
+    "quota": { "daily_tokens": 100000 }   // skip this provider for the rest of the day once reached
+  }
+}
+```
+
+- When a provider's `day_tokens` reaches its `daily_tokens` cap, SwarmForge **skips it** for the
+  rest of the day and prints a warning. The live dashboard (`--serve`) shows the same usage table.
+
 ## Supported agents (auto-detected)
 
 | Tool | Binary | Install | Best for |
 |------|--------|---------|----------|
-| opencode | `opencode` | `npm i -g opencode-ai` | planner, coder, reviewer, fixer |
-| Google Antigravity | `agy` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | planner, coder, fixer |
+| opencode | `opencode` | `npm i -g opencode-ai` | planner, scaffolder, coder, reviewer, fixer |
+| Google Antigravity | `agy` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | planner, scaffolder, coder, fixer |
 | gemini | `gemini` | `npm i -g @google/gemini-cli` | coder, reviewer |
-| grok (xAI) | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` | planner, coder, reviewer |
+| grok (xAI) | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` | planner, scaffolder, coder, reviewer |
 | GitHub Copilot | `copilot` | `npm i -g @github/copilot` | coder, fixer |
 
 Missing tools are simply skipped. You can also add **any custom CLI command** as an agent (see below).
@@ -159,13 +189,15 @@ Everything is configurable: which tools exist, their commands, approval flags, a
 | Role | Job | Picked from |
 |------|-----|-------------|
 | planner | Split the task into 2–6 subtasks, returning a **DAG** (a `depends` field when one subtask needs another) | first available planner-capable tool |
-| coder | Build one subtask inside its own `out/<id>/` folder | round-robin across coder-capable tools |
+| scaffolder | With `--scaffold`: bootstrap the shared project tree first (manifest, layout, entry points, README) | first available scaffolder-capable tool |
+| coder | Build one subtask inside its own `out/<id>/` folder (or `project/<id>/` with `--scaffold`) | round-robin across coder-capable tools |
 | reviewer | Inspect all outputs, return JSON list of issues | a *different* tool than the coders when possible |
 | fixer | Apply the reviewer's fixes | round-robin across fixer-capable tools |
 
 Dependencies are respected: subtasks with no `depends` run in parallel; a subtask that
 `depends` on another waits until its dependency finished (its outputs are passed along
-in `DEPENDENCY OUTPUTS`).
+in `DEPENDENCY OUTPUTS`). With `--scaffold`, a `scaffold` task is inserted first and every
+other subtask depends on it, so the whole swarm builds inside one shared project tree.
 
 The review/fix loop runs up to 2 rounds and stops as soon as a review is clean.
 
@@ -210,9 +242,11 @@ python forge.py "Build a todo web app" --config tests/test-config.json --dir run
 ## Roadmap
 
 - [x] Dependency-aware plan (DAG instead of "all parallel")
-- [ ] `--model` CLI override per role
-- [ ] Token/quota usage dashboard
-- [ ] Auto-init of a fresh project scaffold for the whole swarm
+- [x] `--model` CLI override per role
+- [x] Token/quota usage dashboard
+- [x] Auto-init of a fresh project scaffold for the whole swarm
+- [ ] `--model` / `--provider` pinning for a *specific* subtask id
+- [ ] Rich report diffing between runs
 
 ## License
 

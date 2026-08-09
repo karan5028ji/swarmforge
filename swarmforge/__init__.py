@@ -6,11 +6,12 @@ free-tier AI coding CLIs already installed on your machine (opencode, agy,
 grok, gemini, copilot, ...). No API keys. No servers. No paid tokens.
 
 Pipeline:
-  plan   -> split the task into subtasks (DAG, supports dependencies)
-  build  -> run ready subtasks in parallel, one provider per subtask
-  review -> a reviewer provider hunts for mistakes and gaps
-  fix    -> a fixer provider applies the fixes
-  report -> REPORT.md + report.json + live status.json
+  plan     -> split the task into subtasks (DAG, supports dependencies)
+  scaffold -> optional: bootstrap a shared project tree first (--scaffold)
+  build    -> run ready subtasks in parallel, one provider per subtask
+  review   -> a reviewer provider hunts for mistakes and gaps
+  fix      -> a fixer provider applies the fixes
+  report   -> REPORT.md + report.json + live status.json
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import argparse
 import concurrent.futures
 import datetime as _dt
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -27,7 +29,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 CONFIG_NAME = "agents.json"
 
 # --------------------------------------------------------------------------
@@ -46,7 +48,7 @@ DEFAULT_CONFIG = {
                 "npm": "npm i -g opencode-ai",
                 "curl": "curl -fsSL https://opencode.ai/install | bash",
             },
-            "roles": ["planner", "coder", "reviewer", "fixer"],
+            "roles": ["planner", "scaffolder", "coder", "reviewer", "fixer"],
         },
         "agy": {
             "binary": "agy",
@@ -56,7 +58,7 @@ DEFAULT_CONFIG = {
             "install": {
                 "curl": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
             },
-            "roles": ["planner", "coder", "fixer"],
+            "roles": ["planner", "scaffolder", "coder", "fixer"],
         },
         "gemini": {
             "binary": "gemini",
@@ -72,7 +74,7 @@ DEFAULT_CONFIG = {
             "model_flag": ["-m"],
             "approve_flags": ["--always-approve", "--no-auto-update"],
             "install": {"curl": "curl -fsSL https://x.ai/cli/install.sh | bash"},
-            "roles": ["planner", "coder", "reviewer"],
+            "roles": ["planner", "scaffolder", "coder", "reviewer"],
         },
         "copilot": {
             "binary": "copilot",
@@ -85,6 +87,7 @@ DEFAULT_CONFIG = {
     },
     "roles": {
         "planner": {"providers": ["opencode", "grok", "agy"]},
+        "scaffolder": {"providers": ["opencode", "grok", "agy"]},
         "coder": {"providers": ["opencode", "grok", "agy", "gemini", "copilot"]},
         "reviewer": {"providers": ["grok", "opencode", "gemini"]},
         "fixer": {"providers": ["opencode", "agy", "copilot"]},
@@ -137,6 +140,7 @@ FULL PLAN: {plan_path}
 SHARED CONTEXT: {shared}
 DEPENDENCY OUTPUTS (from earlier subtasks, already built):
 {dep_outputs}
+PROJECT ROOT (the shared build tree, if any): {project_root}
 
 Work ONLY inside your working directory: {outdir}
 Create or edit files there. Never touch anything outside it.
@@ -166,6 +170,26 @@ If no issues, reply with exactly [].
 
 Schema per element:
 {{"severity": "high|medium|low", "path": "relative/path", "problem": "what is wrong", "suggestion": "what to fix"}}""",
+
+    "scaffolder": """[ROLE: scaffolder]
+You are the SCAFFOLDER agent inside SwarmForge. You bootstrap the project that
+every other agent will build inside. You run FIRST - everyone else depends on you.
+
+USER TASK:
+---
+{task}
+---
+
+FULL PLAN: {plan_path}
+PROJECT ROOT (create the skeleton here): {project_root}
+
+Create a real, runnable base project structure directly in the project root:
+package/app manifest, config files, folder layout, entry points, README, .gitignore.
+Keep placeholders minimal - wire up real structure so later agents can drop their
+code in. Do NOT implement features; leave that to the coder agents.
+
+When done, print a short summary line starting with "### SUMMARY".
+""",
 
     "fixer": """[ROLE: fixer]
 You are the FIXER agent inside SwarmForge. A reviewer reported issues in the
@@ -263,19 +287,22 @@ def install_commands(provider: dict):
 # Agent invocation
 # --------------------------------------------------------------------------
 
-def build_command(provider: dict, prompt: str) -> list:
+def build_command(provider: dict, prompt: str, model: str | None = None) -> list:
     cmd = list(provider.get("command", []))
     if provider.get("approve", True):
         cmd += list(provider.get("approve_flags", []))
-    model = provider.get("model")
-    if model:
-        cmd += list(provider.get("model_flag", [])) + [model]
+    model_flag = provider.get("model_flag", [])
+    if model is None:
+        model = provider.get("model")
+    if model and model_flag:
+        cmd += list(model_flag) + [model]
     cmd.append(prompt)
     return cmd
 
 
-def run_agent(provider: dict, prompt: str, cwd, timeout: int, name: str) -> dict:
-    cmd = build_command(provider, prompt)
+def run_agent(provider: dict, prompt: str, cwd, timeout: int, name: str,
+              model: str | None = None) -> dict:
+    cmd = build_command(provider, prompt, model)
     started = _dt.datetime.now()
     try:
         proc = subprocess.run(
@@ -398,6 +425,114 @@ def read_task(raw_args: list) -> str:
 
 
 # --------------------------------------------------------------------------
+# Usage ledger + quotas
+# --------------------------------------------------------------------------
+
+def usage_path(cfg: dict) -> Path:
+    """Global token-usage ledger location (config-overridable)."""
+    custom = cfg.get("defaults", {}).get("usage_file")
+    if custom:
+        return Path(custom).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    return base / "swarmforge" / "usage.json"
+
+
+def load_usage(cfg: dict) -> dict:
+    ledger = {"providers": {}}
+    p = usage_path(cfg)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return ledger
+    if isinstance(data, dict):
+        ledger.update(data)
+    ledger.setdefault("providers", {})
+    return ledger
+
+
+def save_usage(cfg: dict, ledger: dict):
+    p = usage_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def record_usage(cfg: dict, ledger: dict, provider: str, tokens: int, seconds: float):
+    today = _dt.date.today().isoformat()
+    entry = ledger["providers"].setdefault(provider, {})
+    entry["runs"] = entry.get("runs", 0) + 1
+    entry["tokens"] = entry.get("tokens", 0) + int(tokens)
+    entry["seconds"] = round(entry.get("seconds", 0) + float(seconds), 1)
+    if entry.get("day") != today:
+        entry["day"] = today
+        entry["day_tokens"] = 0
+    entry["day_tokens"] = entry.get("day_tokens", 0) + int(tokens)
+    save_usage(cfg, ledger)
+
+
+def record_run_usage(cfg: dict, ledger: dict, results: dict):
+    """Accumulate a finished run's per-provider totals into the global ledger."""
+    if not ledger:
+        return
+    per_provider: dict = {}
+    for _sid, (res, pname) in results.items():
+        agg = per_provider.setdefault(pname, {"tokens": 0, "seconds": 0.0})
+        agg["tokens"] += res.get("tokens", 0)
+        agg["seconds"] += res.get("seconds", 0)
+    for pname, agg in per_provider.items():
+        record_usage(cfg, ledger, pname, agg["tokens"], agg["seconds"])
+
+
+def filter_quota(cfg: dict, avail: dict, ledger: dict):
+    """Drop providers whose today's usage is at/over their daily_tokens quota.
+
+    Returns (still_available, exhausted) where exhausted is a list of
+    (name, used_tokens, limit).
+    """
+    today = _dt.date.today().isoformat()
+    good, exhausted = {}, []
+    for name, info in avail.items():
+        limit = info.get("quota", {}).get("daily_tokens")
+        if not limit:
+            good[name] = info
+            continue
+        entry = ledger["providers"].get(name, {})
+        used = entry.get("day_tokens", 0) if entry.get("day") == today else 0
+        if used >= limit:
+            exhausted.append((name, used, limit))
+        else:
+            good[name] = info
+    return good, exhausted
+
+
+def render_usage(cfg: dict, det: dict, ledger: dict):
+    today = _dt.date.today().isoformat()
+    print("\nSwarmForge - usage dashboard\n")
+    print(f"Ledger: {usage_path(cfg)}\n")
+    names = sorted(set(list(ledger["providers"]) + list(det)))
+    print(f"  {'provider':<12} {'runs':>5} {'est. tokens':>12} {'today':>10} "
+          f"{'daily limit':>12}  status")
+    for name in names:
+        entry = ledger["providers"].get(name, {})
+        day_tokens = entry.get("day_tokens", 0) if entry.get("day") == today else 0
+        limit = det.get(name, {}).get("quota", {}).get("daily_tokens")
+        limit_s = str(limit) if limit else "-"
+        if name in det:
+            status = "available" if det[name]["available"] else "not installed"
+        else:
+            status = "no config"
+        if limit and day_tokens >= limit:
+            status = "QUOTA EXHAUSTED"
+        elif limit and day_tokens:
+            pct = day_tokens * 100 // limit
+            status = f"{pct}% used"
+        print(f"  {name:<12} {entry.get('runs', 0):>5} {entry.get('tokens', 0):>12,} "
+              f"{day_tokens:>10,} {limit_s:>12}  {status}")
+
+
+# --------------------------------------------------------------------------
 # Live status (for the web dashboard)
 # --------------------------------------------------------------------------
 
@@ -440,29 +575,30 @@ class LiveStatus:
 # Phases
 # --------------------------------------------------------------------------
 
-def plan_phase(cfg, avail, used, task, shared, timeout, status):
+def plan_phase(cfg, avail, used, task, shared, timeout, status, models=None):
     pname = pick_provider("planner", avail, used, cfg)
     if not pname:
         return None
     p = avail[pname]
     prompt = role_prompt(cfg, "planner", task=task, shared=str(shared))
     status.log(f"planner -> {pname}")
-    res = run_agent(p, prompt, shared, timeout, "planner")
+    res = run_agent(p, prompt, shared, timeout, "planner", (models or {}).get("planner"))
     (shared / "planner.log").write_text(
         res["stdout"] + "\n--- stderr ---\n" + res["stderr"], encoding="utf-8")
     return parse_subtasks(res["stdout"])
 
 
 def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
-                max_parallel, status):
+                max_parallel, status, models=None):
     results: dict = {}
     pending = {s["id"]: s for s in plan}
     deps_map = {s["id"]: [d for d in s.get("depends", []) if d in pending] for s in plan}
+    models = models or {}
 
     def worker(s):
-        sdir = outroot / s["id"]
-        sdir.mkdir(parents=True, exist_ok=True)
         role = s.get("role") or "coder"
+        sdir = outroot if role == "scaffolder" else outroot / s["id"]
+        sdir.mkdir(parents=True, exist_ok=True)
         pname = pick_provider(role, avail, used, cfg)
         p = avail[pname]
         dep_dirs = [str(outroot / d) for d in deps_map[s["id"]]]
@@ -470,12 +606,15 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
         prompt = role_prompt(
             cfg, role, task=task, subtask=json.dumps(s, ensure_ascii=False),
             plan_path=str(shared / "plan.json"), shared=str(shared),
-            outdir=str(sdir), outroot=str(outroot), dep_outputs=dep_outputs)
+            outdir=str(sdir), outroot=str(outroot), dep_outputs=dep_outputs,
+            project_root=str(outroot))
         status.log(f"build {s['id']} -> {pname}")
-        res = run_agent(p, prompt, sdir, timeout, s["id"])
-        (sdir / "agent.log").write_text(
+        res = run_agent(p, prompt, sdir, timeout, s["id"], models.get(role))
+        meta_dir = outroot / "_meta" / s["id"]
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        (meta_dir / "agent.log").write_text(
             res["stdout"] + "\n--- stderr ---\n" + res["stderr"], encoding="utf-8")
-        (sdir / "result.json").write_text(
+        (meta_dir / "result.json").write_text(
             json.dumps({"provider": pname, **res}, ensure_ascii=False), encoding="utf-8")
         ok = res["returncode"] == 0
         status.add_agent(s["id"], pname, "ok" if ok else f"rc={res['returncode']}",
@@ -503,8 +642,10 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
     return results
 
 
-def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status):
+def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
+                    models=None):
     issues = []
+    models = models or {}
     for round_no in range(1, 3):
         rname = pick_provider("reviewer", avail, used, cfg)
         r = avail[rname]
@@ -512,7 +653,7 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status):
             cfg, "reviewer", task=task, plan_path=str(shared / "plan.json"),
             shared=str(shared), outroot=str(outroot))
         status.log(f"review (round {round_no}) -> {rname}")
-        res = run_agent(r, prompt, outroot, timeout, "reviewer")
+        res = run_agent(r, prompt, outroot, timeout, "reviewer", models.get("reviewer"))
         (shared / f"review_{round_no}.log").write_text(
             res["stdout"] + "\n--- stderr ---\n" + res["stderr"], encoding="utf-8")
         issues = parse_issues(res["stdout"])
@@ -528,7 +669,7 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status):
             cfg, "fixer", task=task, issues=json.dumps(issues, indent=2, ensure_ascii=False),
             shared=str(shared), outroot=str(outroot))
         status.log(f"fix -> {fname}")
-        run_agent(f, fprompt, outroot, timeout, "fixer")
+        run_agent(f, fprompt, outroot, timeout, "fixer", models.get("fixer"))
         if round_no == 2:
             status.log("max fix rounds reached")
     return issues
@@ -537,7 +678,8 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status):
 def load_results(outroot: Path) -> dict:
     results = {}
     if outroot.exists():
-        for rj in outroot.glob("*/result.json"):
+        rjs = list(outroot.glob("*/result.json")) + list(outroot.glob("_meta/*/result.json"))
+        for rj in rjs:
             try:
                 data = json.loads(rj.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001
@@ -549,7 +691,8 @@ def load_results(outroot: Path) -> dict:
     return results
 
 
-def write_report(ws: Path, task, plan, results, issues):
+def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = None):
+    outroot = outroot or (ws / "out")
     lines = []
     a = lines.append
     a("# SwarmForge Report")
@@ -608,11 +751,15 @@ def write_report(ws: Path, task, plan, results, issues):
     a("## Files")
     a("")
     for s in plan:
-        sdir = ws / "out" / s["id"]
-        a(f"### {s['id']} - {s['title']} (`{sdir.name}`)")
+        if s.get("role") == "scaffolder":
+            base = outroot
+        else:
+            base = outroot / s["id"]
+        a(f"### {s['id']} - {s['title']} (`{base.name}`)")
         a("")
-        files = [f for f in sorted(sdir.rglob("*"))
-                 if f.is_file() and f.name not in ("agent.log", "result.json")]
+        files = [f for f in sorted(base.rglob("*"))
+                 if f.is_file() and f.name not in ("agent.log", "result.json")
+                 and "_meta" not in f.parts]
         if files:
             for f in files:
                 a(f"- `{f.relative_to(ws)}`")
@@ -676,6 +823,11 @@ DASHBOARD_HTML = """<!doctype html>
   <thead><tr><th>id</th><th>provider</th><th>status</th><th>seconds</th><th>est. tokens</th></tr></thead>
   <tbody id="agents"></tbody>
 </table>
+<h2>Usage</h2>
+<table>
+  <thead><tr><th>provider</th><th>runs</th><th>est. tokens</th><th>today</th><th>daily limit</th></tr></thead>
+  <tbody id="usage"></tbody>
+</table>
 <h2>Logs</h2>
 <div id="logs"></div>
 <script>
@@ -691,6 +843,12 @@ async function poll(){
       '</td><td>'+esc(a.seconds)+'</td><td>'+esc(a.tokens)+'</td></tr>').join('');
     document.getElementById('logs').textContent=(s.logs||[]).join('\\n');
   }catch(e){}
+  try{
+    const r=await fetch('/usage.json');const u=await r.json();
+    document.getElementById('usage').innerHTML=(u.rows||[]).map(x=>
+      '<tr><td>'+esc(x.provider)+'</td><td>'+esc(x.runs)+'</td><td>'+esc(x.tokens)+
+      '</td><td>'+esc(x.today)+'</td><td>'+esc(x.limit)+'</td></tr>').join('');
+  }catch(e){}
 }
 setInterval(poll,1200);poll();
 </script>
@@ -698,9 +856,24 @@ setInterval(poll,1200);poll();
 </html>"""
 
 
-def serve(workspace: str, port: int):
+def serve(workspace: str, port: int, cfg: dict | None = None):
     root = Path(workspace)
     root.mkdir(parents=True, exist_ok=True)
+    ledger = load_usage(cfg) if cfg else {"providers": {}}
+    det = detect(cfg) if cfg else {}
+
+    def usage_rows():
+        today = _dt.date.today().isoformat()
+        rows = []
+        names = sorted(set(list(ledger["providers"]) + list(det)))
+        for name in names:
+            entry = ledger["providers"].get(name, {})
+            day_tokens = entry.get("day_tokens", 0) if entry.get("day") == today else 0
+            limit = det.get(name, {}).get("quota", {}).get("daily_tokens")
+            rows.append({"provider": name, "runs": entry.get("runs", 0),
+                         "tokens": entry.get("tokens", 0),
+                         "today": day_tokens, "limit": limit or ""})
+        return rows
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # silence
@@ -722,7 +895,10 @@ def serve(workspace: str, port: int):
                     sp = root / "status.json"
                     data = sp.read_bytes() if sp.exists() else b"{}"
                     self._send(data, "application/json")
-                elif path.startswith("/out/") or path.startswith("/memory/"):
+                elif path == "/usage.json":
+                    self._send(json.dumps({"rows": usage_rows()}).encode("utf-8"),
+                               "application/json")
+                elif path.startswith(("/out/", "/memory/", "/project/")):
                     rel = path.lstrip("/")
                     target = (root / rel).resolve()
                     if str(target).startswith(str(root.resolve())) and target.is_file():
@@ -748,12 +924,13 @@ def serve(workspace: str, port: int):
 # Full pipeline
 # --------------------------------------------------------------------------
 
-def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel):
+def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
+                 ledger=None, models=None):
     ws = Path(workspace)
     ws.mkdir(parents=True, exist_ok=True)
     shared = ws / "memory"
     shared.mkdir(exist_ok=True)
-    outroot = ws / "out"
+    outroot = ws / ("project" if getattr(args, "scaffold", False) else "out")
     outroot.mkdir(exist_ok=True)
     (shared / "task.md").write_text(task, encoding="utf-8")
     used: dict = {}
@@ -774,11 +951,23 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel):
                  "detail": task, "depends": []}]
     else:
         status.set(phase="planning")
-        plan = plan_phase(cfg, avail, used, task, shared, timeout, status)
+        plan = plan_phase(cfg, avail, used, task, shared, timeout, status, models)
         if not plan:
             print("  [warn] Planner returned no valid JSON - falling back to a single task.")
             plan = [{"id": "t1", "role": "coder", "title": "Whole task",
                      "detail": task, "depends": []}]
+    if args.scaffold:
+        scaffold = {"id": "scaffold", "role": "scaffolder",
+                    "title": "Project scaffold",
+                    "detail": "Bootstrap the base project structure.",
+                    "depends": []}
+        plan = [scaffold] + [dict(s) for s in plan]
+        for s in plan[1:]:
+            deps = list(s.get("depends", []) or [])
+            if "scaffold" not in deps:
+                deps.append("scaffold")
+            s["depends"] = deps
+        status.log("scaffold mode: all subtasks depend on scaffold")
     (shared / "plan.json").write_text(
         json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
     status.set(phase="building", subtasks=[s["id"] for s in plan])
@@ -790,24 +979,26 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel):
 
     # 2. BUILD (parallel waves by dependency) ------------------------------
     results = build_phase(cfg, avail, used, task, shared, outroot, plan,
-                          timeout, max_parallel, status)
+                          timeout, max_parallel, status, models)
 
     # 3. REVIEW + FIX ------------------------------------------------------
     issues = []
     if not (args.quick or args.no_review):
         status.set(phase="reviewing")
-        issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status)
+        issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout,
+                                 status, models)
 
     # 4. REPORT ------------------------------------------------------------
     status.set(phase="reporting")
-    write_report(ws, task, plan, results, issues)
+    write_report(ws, task, plan, results, issues, outroot)
+    record_run_usage(cfg, ledger, results)
     status.set(phase="done")
     print(f"\n[report] {ws / 'REPORT.md'}")
     print(f"[report] {ws / 'report.json'}")
     print("[done]  SwarmForge run complete.")
 
 
-def continue_pipeline(cfg, avail, workspace, args, timeout):
+def continue_pipeline(cfg, avail, workspace, args, timeout, ledger=None, models=None):
     ws = Path(workspace)
     shared = ws / "memory"
     plan_path = shared / "plan.json"
@@ -816,7 +1007,7 @@ def continue_pipeline(cfg, avail, workspace, args, timeout):
         return 1
     task = (shared / "task.md").read_text(encoding="utf-8") if (shared / "task.md").exists() else ""
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    outroot = ws / "out"
+    outroot = ws / "project" if (ws / "project").exists() else ws / "out"
     results = load_results(outroot)
     used: dict = {}
     status = LiveStatus(workspace)
@@ -826,8 +1017,10 @@ def continue_pipeline(cfg, avail, workspace, args, timeout):
     print(f"\nSwarmForge {VERSION} - resuming workspace: {workspace}\n")
     issues = []
     if not args.no_review:
-        issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status)
-    write_report(ws, task, plan, results, issues)
+        issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout,
+                                 status, models)
+    write_report(ws, task, plan, results, issues, outroot)
+    record_run_usage(cfg, ledger, results)
     status.set(phase="done")
     print(f"\n[report] {ws / 'REPORT.md'}")
     print("[done]  SwarmForge resume complete.")
@@ -872,8 +1065,9 @@ def interactive_install(det):
     print("\nInstall done. Naya terminal kholo ya phir se detect karo: swarmforge --check")
 
 
-def dry_run(cfg, det, task):
+def dry_run(cfg, det, task, models=None):
     avail = available_providers(det)
+    models = models or {}
     print("\nSwarmForge - dry run (kuch execute nahi hoga)\n")
     print(f"Task: {task[:80]}{'...' if len(task) > 80 else ''}\n")
     for role in cfg.get("roles", {}):
@@ -882,11 +1076,15 @@ def dry_run(cfg, det, task):
             names = list(avail.keys())
         who = names[0] if names else "?"
         if who in avail:
-            cmd = build_command(avail[who], f"<{role} prompt>")
-            print(f"  {role:<9s} -> {who:<10s} {cmd}")
+            cmd = build_command(avail[who], f"<{role} prompt>", models.get(role))
+            print(f"  {role:<10s} -> {who:<10s} {cmd}")
         else:
-            print(f"  {role:<9s} -> (no provider available)")
-    print("\n  plan -> parallel build -> review -> fix -> report. Dashboard: --serve")
+            print(f"  {role:<10s} -> (no provider available)")
+    if models:
+        print("\n  Model overrides:")
+        for role, m in models.items():
+            print(f"    {role} = {m}")
+    print("\n  plan -> [scaffold?] -> parallel build -> review -> fix -> report. Dashboard: --serve")
 
 
 # --------------------------------------------------------------------------
@@ -914,6 +1112,12 @@ def main(argv=None):
                     help="Serve a live web dashboard (default port 8787)")
     ap.add_argument("--max-parallel", type=int, help="Max agents running at once")
     ap.add_argument("--timeout", type=int, help="Per-agent timeout in seconds")
+    ap.add_argument("--model", action="append", metavar="ROLE=MODEL",
+                    help="Override the model for a role (repeatable, e.g. coder=grok-3-mini)")
+    ap.add_argument("--scaffold", action="store_true",
+                    help="Bootstrap a shared project tree first; all subtasks build inside it")
+    ap.add_argument("--stats", action="store_true",
+                    help="Show the token-usage dashboard (global ledger) and exit")
     ap.add_argument("--version", action="version", version=f"SwarmForge {VERSION}")
     args = ap.parse_args(argv)
 
@@ -931,22 +1135,43 @@ def main(argv=None):
     timeout = args.timeout or defaults.get("timeout", 900)
     max_parallel = args.max_parallel or defaults.get("max_parallel", 4)
     det = detect(cfg)
+    ledger = load_usage(cfg)
+
+    models = {}
+    for pair in (args.model or []):
+        if "=" in pair:
+            role, m = pair.split("=", 1)
+            role = role.strip()
+            if role not in cfg.get("roles", {}):
+                print(f"  [warn] Unknown role '{role}' for --model "
+                      f"(known: {', '.join(sorted(cfg.get('roles', {})))})")
+            models[role] = m
+        else:
+            for role in cfg.get("roles", {}):
+                models[role] = pair
 
     if args.check:
         check_report(cfg, det)
+        return 0
+    if args.stats:
+        render_usage(cfg, det, ledger)
         return 0
     if args.install:
         interactive_install(det)
         return 0
 
     avail = available_providers(det)
+    avail, exhausted = filter_quota(cfg, avail, ledger)
+    if exhausted:
+        for name, used, limit in exhausted:
+            print(f"  [x]   {name}: daily quota exhausted ({used:,}/{limit:,} tokens) - skipping.")
     if not avail:
         print("[x] Koi bhi AI CLI install nahi hai.")
         print("    Check: swarmforge --check | Install: swarmforge --install")
         return 1
 
     if args.dry_run:
-        dry_run(cfg, det, " ".join(args.task))
+        dry_run(cfg, det, " ".join(args.task), models)
         return 0
 
     if args.cont:
@@ -954,8 +1179,8 @@ def main(argv=None):
             print("[x] --continue ke liye --dir <existing workspace> chahiye.")
             return 1
         if args.serve:
-            serve(args.dir, args.serve)
-        return continue_pipeline(cfg, avail, args.dir, args, timeout)
+            serve(args.dir, args.serve, cfg)
+        return continue_pipeline(cfg, avail, args.dir, args, timeout, ledger, models)
 
     task = read_task(args.task)
     if not task:
@@ -964,8 +1189,8 @@ def main(argv=None):
 
     workspace = args.dir or make_workspace(task)
     if args.serve:
-        serve(workspace, args.serve)
-    run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel)
+        serve(workspace, args.serve, cfg)
+    run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel, ledger, models)
     return 0
 
 

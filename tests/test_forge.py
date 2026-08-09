@@ -12,12 +12,46 @@ from swarmforge import (  # noqa: E402
     build_phase,
     estimate_tokens,
     extract_json_array,
+    filter_quota,
+    load_usage,
     load_config,
     main,
     parse_issues,
     parse_subtasks,
     pick_provider,
+    record_usage,
+    render_usage,
+    usage_path,
 )
+
+
+def _write_temp_config(tmp: Path, usage_file: str | None = None,
+                       quota: dict | None = None) -> Path:
+    mock = str(ROOT / "tests" / "mock_agent.py")
+    cfg = {
+        "version": 1,
+        "defaults": {"timeout": 60, "max_parallel": 4},
+        "providers": {
+            "mocka": {"always_available": True, "command": ["python", mock, "mocka"],
+                      "roles": ["planner", "scaffolder", "coder", "reviewer", "fixer"]},
+            "mockb": {"always_available": True, "command": ["python", mock, "mockb"],
+                      "roles": ["coder", "reviewer"]},
+        },
+        "roles": {
+            "planner": {"providers": ["mocka"]},
+            "scaffolder": {"providers": ["mocka"]},
+            "coder": {"providers": ["mocka", "mockb"]},
+            "reviewer": {"providers": ["mockb"]},
+            "fixer": {"providers": ["mocka"]},
+        },
+    }
+    if quota:
+        cfg["providers"]["mocka"]["quota"] = quota
+    if usage_file:
+        cfg["defaults"]["usage_file"] = str(usage_file)
+    p = tmp / "cfg.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+    return p
 
 
 class TestParsing(unittest.TestCase):
@@ -160,6 +194,126 @@ class TestDag(unittest.TestCase):
             self.assertTrue((outroot / "t1").exists())
             for sid, (res, _p) in results.items():
                 self.assertEqual(res["returncode"], 0, sid)
+
+
+class TestModelOverride(unittest.TestCase):
+    def test_build_command_model_override(self):
+        provider = {"command": ["grok", "-p"], "model_flag": ["-m"], "model": "default"}
+        cmd = build_command(provider, "hello", model="grok-3-mini")
+        self.assertEqual(cmd, ["grok", "-p", "-m", "grok-3-mini", "hello"])
+
+    def test_build_command_uses_provider_model_by_default(self):
+        provider = {"command": ["grok", "-p"], "model_flag": ["-m"], "model": "default"}
+        cmd = build_command(provider, "hello")
+        self.assertEqual(cmd, ["grok", "-p", "-m", "default", "hello"])
+
+    def test_build_command_override_with_no_model_flag(self):
+        provider = {"command": ["copilot", "-p"], "model_flag": [], "model": "x"}
+        cmd = build_command(provider, "hello", model="ignored")
+        self.assertEqual(cmd, ["copilot", "-p", "hello"])
+
+    def test_main_accepts_model_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            ws = tmp / "ws"
+            rc = main(["Task", "--model", "coder=big-model",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+
+
+class TestUsage(unittest.TestCase):
+    def test_ledger_roundtrip_and_accumulate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = {"defaults": {"usage_file": str(tmp / "usage.json")}}
+            ledger = load_usage(cfg)
+            record_usage(cfg, ledger, "grok", 100, 1.5)
+            record_usage(cfg, ledger, "grok", 50, 0.5)
+            reloaded = load_usage(cfg)
+            entry = reloaded["providers"]["grok"]
+            self.assertEqual(entry["runs"], 2)
+            self.assertEqual(entry["tokens"], 150)
+            self.assertEqual(entry["day_tokens"], 150)
+            self.assertEqual(entry["seconds"], 2.0)
+            self.assertEqual(usage_path(cfg), tmp / "usage.json")
+
+    def test_quota_filter_exhausted(self):
+        avail = {
+            "a": {"quota": {"daily_tokens": 100}},
+            "b": {"quota": {"daily_tokens": 100}},
+            "c": {},
+        }
+        today = __import__("datetime").date.today().isoformat()
+        ledger = {"providers": {
+            "a": {"day": today, "day_tokens": 100},
+            "b": {"day": today, "day_tokens": 99},
+            "c": {"day": today, "day_tokens": 999},
+        }}
+        good, exhausted = filter_quota({}, avail, ledger)
+        self.assertEqual(set(good), {"b", "c"})
+        self.assertEqual([e[0] for e in exhausted], ["a"])
+
+    def test_quota_filter_rolls_over_at_midnight(self):
+        avail = {"a": {"quota": {"daily_tokens": 100}}}
+        ledger = {"providers": {"a": {"day": "2000-01-01", "day_tokens": 999}}}
+        good, exhausted = filter_quota({}, avail, ledger)
+        self.assertIn("a", good)
+        self.assertEqual(exhausted, [])
+
+    def test_stats_mode_via_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_temp_config(tmp, usage_file=str(tmp / "usage.json"))
+            ws = tmp / "ws"
+            rc = main(["Task", "--config", str(cfg), "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            rc = main(["--stats", "--config", str(cfg)])
+            self.assertEqual(rc, 0)
+            ledger = load_usage(load_config(str(cfg)))
+            names = set(ledger["providers"])
+            self.assertTrue(names & {"mocka", "mockb"})
+
+    def test_render_usage_prints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = {"defaults": {"usage_file": str(tmp / "usage.json")}}
+            ledger = load_usage(cfg)
+            render_usage(cfg, {"mocka": {"available": True}, "mockb": {"available": False}},
+                         ledger)
+
+
+class TestScaffold(unittest.TestCase):
+    def test_scaffold_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            ws = tmp / "ws"
+            rc = main(["Build a todo web app", "--scaffold",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            plan = json.loads((ws / "memory" / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan[0]["role"], "scaffolder")
+            self.assertEqual(plan[0]["id"], "scaffold")
+            for s in plan[1:]:
+                self.assertIn("scaffold", s["depends"])
+            self.assertTrue((ws / "project").exists())
+            self.assertTrue((ws / "project" / "mock_output.txt").exists())
+            self.assertTrue((ws / "project" / "_meta" / "scaffold" / "result.json").exists())
+            report = json.loads((ws / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(report["plan"]), 3)
+
+    def test_scaffold_quick_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            ws = tmp / "ws"
+            rc = main(["Quick task", "--quick", "--scaffold", "--no-review",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            plan = json.loads((ws / "memory" / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan[0]["role"], "scaffolder")
+            self.assertEqual(len(plan), 2)
 
 
 if __name__ == "__main__":
