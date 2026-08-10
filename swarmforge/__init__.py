@@ -30,7 +30,7 @@ import urllib.parse as _urllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 CONFIG_NAME = "agents.json"
 
 # --------------------------------------------------------------------------
@@ -835,6 +835,21 @@ class LiveStatus:
                 "seconds": round(seconds, 1), "tokens": tokens})
             self.flush()
 
+    def agent_started(self, subtask, provider):
+        with self.lock:
+            running = [r for r in self.data.get("running", [])
+                       if r["id"] != subtask]
+            running.append({"id": subtask, "provider": provider,
+                            "started": _dt.datetime.now().isoformat(timespec="seconds")})
+            self.data["running"] = running
+            self.flush()
+
+    def agent_finished(self, subtask):
+        with self.lock:
+            self.data["running"] = [r for r in self.data.get("running", [])
+                                    if r["id"] != subtask]
+            self.flush()
+
     def flush(self):
         try:
             self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
@@ -980,7 +995,9 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
             outdir=str(sdir), outroot=str(outroot), dep_outputs=dep_outputs,
             project_root=str(outroot))
         status.log(f"build {s['id']} -> {pname}")
+        status.agent_started(s["id"], pname)
         res = run_agent(p, prompt, sdir, timeout, s["id"], models.get(role))
+        status.agent_finished(s["id"])
         meta_dir = outroot / "_meta" / s["id"]
         meta_dir.mkdir(parents=True, exist_ok=True)
         (meta_dir / "agent.log").write_text(
@@ -1024,7 +1041,9 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
             cfg, "reviewer", task=task, plan_path=str(shared / "plan.json"),
             shared=str(shared), outroot=str(outroot))
         status.log(f"review (round {round_no}) -> {rname}")
+        status.agent_started(f"review r{round_no}", rname)
         res = run_agent(r, prompt, outroot, timeout, "reviewer", models.get("reviewer"))
+        status.agent_finished(f"review r{round_no}")
         (shared / f"review_{round_no}.log").write_text(
             res["stdout"] + "\n--- stderr ---\n" + res["stderr"], encoding="utf-8")
         issues = parse_issues(res["stdout"])
@@ -1050,7 +1069,9 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
             cfg, "fixer", task=task, issues=json.dumps(issues, indent=2, ensure_ascii=False),
             shared=str(shared), outroot=str(outroot))
         status.log(f"fix -> {fname}")
+        status.agent_started(f"fix r{round_no}", fname)
         run_agent(f, fprompt, outroot, timeout, "fixer", models.get("fixer"))
+        status.agent_finished(f"fix r{round_no}")
         if round_no == 2:
             status.log("max fix rounds reached")
     return issues
@@ -1196,89 +1217,185 @@ DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SwarmForge — live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwarmForge — live dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      fontFamily: { mono: ['ui-monospace','Menlo','Consolas','monospace'] },
+      colors: { base:'#0f1117', panel:'#161a22', edge:'#1f2430', accent:'#8b5cf6' }
+    }
+  }
+};
+</script>
 <style>
-  body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0f1117;color:#d7dae0;margin:0;padding:24px}
-  h1{color:#8b5cf6;font-size:20px;margin:0 0 4px}
-  .sub{color:#6b7280;font-size:12px;margin-bottom:20px}
-  .badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;margin-left:8px}
-  .ok{background:#123524;color:#4ade80}.run{background:#1e1b4b;color:#a5b4fc}.fail{background:#3b0d17;color:#f87171}
-  .saved{background:#0c3b2e;color:#4ade80;padding:8px 14px;border-radius:8px;display:inline-block;font-size:13px;font-weight:600;margin-bottom:14px}
-  table{border-collapse:collapse;width:100%;margin-bottom:24px;font-size:13px}
-  th,td{border-bottom:1px solid #1f2430;text-align:left;padding:8px 10px}
-  th{color:#8b5cf6;font-weight:600}
-  #logs{background:#0a0c11;border:1px solid #1f2430;border-radius:8px;padding:12px;font-size:12px;height:220px;overflow:auto;white-space:pre-wrap}
-  .files a{color:#60a5fa;text-decoration:none}
-  h2{color:#8b5cf6;font-size:14px;margin:20px 0 8px}
-  #approval{display:none;border:1px solid #f59e0b;background:#2a2007;border-radius:8px;padding:14px 16px;margin:16px 0}
-  #approval.pending{display:block}
-  #approval .title{color:#fbbf24;font-weight:700;font-size:14px;margin-bottom:8px}
-  #approval ul{margin:8px 0 12px;padding-left:20px;font-size:12px;color:#e5e7eb}
-  .abtn{border:0;border-radius:6px;padding:8px 18px;margin-right:10px;font-size:13px;font-weight:600;cursor:pointer}
-  .abtn.fix{background:#4ade80;color:#052e16}
-  .abtn.skip{background:#1f2430;color:#d7dae0;border:1px solid #3a4152}
+  .glow-green{text-shadow:0 0 18px rgba(74,222,128,.85)}
+  .glow-amber{text-shadow:0 0 18px rgba(251,191,36,.85)}
+  .spin-ring{animation:spinr 1s linear infinite;display:inline-block}
+  @keyframes spinr{to{transform:rotate(360deg)}}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:#1f2430;border-radius:4px}
 </style>
 </head>
-<body>
-<h1>SwarmForge</h1>
-<div class="sub">multi-agent build in progress — <span id="phase">...</span></div>
-<div id="approval">
-  <div class="title">Reviewer found issues — approve auto-fix?</div>
-  <div id="approval-issues"></div>
-  <button class="abtn fix" onclick="decide('fix')">Approve Fix</button>
-  <button class="abtn skip" onclick="decide('skip')">Skip Fixes</button>
-</div>
-<div><span class="saved">Estimated API cost saved: <span id="saved">$0.00</span> (free-tier)</span></div>
-<table>
-  <thead><tr><th>provider</th></tr></thead>
-  <tbody id="providers"></tbody>
-</table>
-<h2>Agents</h2>
-<table>
-  <thead><tr><th>id</th><th>provider</th><th>status</th><th>seconds</th><th>est. tokens</th></tr></thead>
-  <tbody id="agents"></tbody>
-</table>
-<h2>Usage</h2>
-<table>
-  <thead><tr><th>provider</th><th>runs</th><th>est. tokens</th><th>today</th><th>daily limit</th><th>$ saved</th></tr></thead>
-  <tbody id="usage"></tbody>
-</table>
-<h2>Logs</h2>
-<div id="logs"></div>
+<body class="bg-base text-gray-200 font-mono min-h-screen p-4 md:p-6">
+
+  <div class="max-w-6xl mx-auto">
+    <div class="flex items-center justify-between flex-wrap gap-2">
+      <div>
+        <h1 class="text-2xl font-bold text-accent tracking-tight">SwarmForge</h1>
+        <p class="text-xs text-gray-500">multi-agent build · <span id="phase" class="text-accent font-semibold">connecting…</span></p>
+      </div>
+      <div class="rounded-xl border border-emerald-500/40 bg-emerald-950/60 px-5 py-3 shadow-[0_0_30px_rgba(74,222,128,0.28)]">
+        <div class="text-[11px] uppercase tracking-widest text-emerald-300/80">Estimated API cost saved</div>
+        <div class="text-2xl font-bold text-emerald-300 glow-green" id="saved">$0.00</div>
+        <div class="text-[10px] text-emerald-500/70">free-tier tools · no API keys</div>
+      </div>
+    </div>
+
+    <div class="mt-4 rounded-xl border border-edge bg-panel px-4 py-3 text-sm text-gray-300" id="task-box">Waiting for task…</div>
+
+    <div class="mt-6 rounded-2xl border border-edge bg-panel p-5">
+      <div class="text-[11px] uppercase tracking-widest text-gray-500 mb-4">Pipeline</div>
+      <div id="pipeline" class="flex items-center gap-1 flex-wrap"></div>
+    </div>
+
+    <div class="mt-6">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-[11px] uppercase tracking-widest text-gray-500">Agents</div>
+        <div class="text-[11px] text-gray-600"><span id="run-count">0</span> running</div>
+      </div>
+      <div id="agents-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3"></div>
+    </div>
+
+    <div class="mt-8 rounded-2xl border border-edge bg-panel overflow-hidden">
+      <div class="px-5 py-3 text-[11px] uppercase tracking-widest text-gray-500 border-b border-edge">Usage (free-tier)</div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-xs text-accent uppercase tracking-wider">
+              <th class="px-5 py-2">provider</th><th class="px-3 py-2">runs</th>
+              <th class="px-3 py-2">est. tokens</th><th class="px-3 py-2">today</th>
+              <th class="px-3 py-2">daily limit</th><th class="px-5 py-2 text-right">$ saved</th>
+            </tr>
+          </thead>
+          <tbody id="usage" class="divide-y divide-edge"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="mt-8 rounded-2xl border border-edge bg-panel overflow-hidden">
+      <div class="px-5 py-3 text-[11px] uppercase tracking-widest text-gray-500 border-b border-edge">Live logs</div>
+      <pre id="logs" class="p-4 h-64 overflow-auto text-xs text-gray-400 whitespace-pre-wrap"></pre>
+    </div>
+  </div>
+
+  <div id="hitl-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+    <div class="w-full max-w-lg rounded-2xl border border-amber-500/50 bg-panel shadow-[0_0_60px_rgba(251,191,36,0.25)] overflow-hidden">
+      <div class="px-6 py-4 border-b border-edge flex items-center gap-3">
+        <span class="w-3 h-3 rounded-full bg-amber-400 animate-pulse"></span>
+        <div>
+          <div class="text-amber-300 glow-amber font-bold">Human review needed</div>
+          <div class="text-xs text-gray-400" id="hitl-title">The reviewer found issues — approve the auto-fix?</div>
+        </div>
+      </div>
+      <ul id="hitl-issues" class="px-6 py-4 max-h-60 overflow-auto divide-y divide-edge text-sm text-gray-300"></ul>
+      <div class="px-6 py-4 bg-black/20 flex gap-3 justify-end">
+        <button onclick="decide('skip')" class="px-4 py-2 rounded-lg border border-edge text-gray-300 hover:bg-gray-800 transition">Skip Fixes</button>
+        <button onclick="decide('fix')" class="px-4 py-2 rounded-lg bg-emerald-500 text-black font-bold hover:bg-emerald-400 transition shadow-[0_0_20px_rgba(74,222,128,0.4)]">Approve Fix</button>
+      </div>
+    </div>
+  </div>
+
 <script>
+const STEPS=['Plan','Scaffold','Build','Review','Fix','Report'];
+const PHASE_IDX={planning:0,scaffolding:1,building:2,reviewing:3,awaiting_approval:3,fixing:4,reporting:5};
 function esc(s){return (s||'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function decide(d){fetch('/approve?decision='+d);document.getElementById('approval').className='';}
+function decide(d){fetch('/approve?decision='+d);document.getElementById('hitl-modal').classList.add('hidden');}
+function renderPipeline(s){
+  const cur=PHASE_IDX[s.phase];const done=s.phase==='done';
+  document.getElementById('pipeline').innerHTML=STEPS.map((st,i)=>{
+    let cls='flex-1 min-w-[80px] rounded-xl border px-3 py-2 text-center text-xs font-semibold transition';
+    if(done||(cur!==undefined&&i<cur)) cls+=' border-emerald-500/40 bg-emerald-950/50 text-emerald-300';
+    else if(cur===i){
+      if(s.phase==='awaiting_approval') cls+=' border-amber-500/60 bg-amber-950/50 text-amber-300 animate-pulse';
+      else cls+=' border-accent/60 bg-violet-950/40 text-accent animate-pulse shadow-[0_0_18px_rgba(139,92,246,0.35)]';
+    }else cls+=' border-edge bg-panel text-gray-600';
+    return '<div class="'+cls+'">'+st+'</div>';
+  }).join('');
+}
+function renderAgents(s){
+  const running=s.running||[];const agents=(s.agents||[]).slice(-8).reverse();
+  document.getElementById('run-count').textContent=running.length;
+  const seen={};const cards=[];
+  running.forEach(r=>{seen[r.id]=1;cards.push({id:r.id,provider:r.provider,status:'running',running:true});});
+  agents.forEach(a=>{if(!seen[a.id])cards.push(a);});
+  if(!cards.length){
+    document.getElementById('agents-grid').innerHTML=
+      '<div class="col-span-full rounded-xl border border-dashed border-edge p-8 text-center text-gray-600">No agents yet — build waves will appear here.</div>';
+    return;
+  }
+  document.getElementById('agents-grid').innerHTML=cards.map(a=>{
+    const isRun=!!a.running;
+    const badge=isRun
+      ? '<span class="inline-flex items-center gap-2 rounded-full bg-amber-500/15 text-amber-300 px-2.5 py-0.5 text-[10px] uppercase tracking-wider"><span class="w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full spin-ring"></span>running</span>'
+      : (a.status==='ok'
+        ? '<span class="rounded-full bg-emerald-500/15 text-emerald-300 px-2.5 py-0.5 text-[10px] uppercase tracking-wider">ok</span>'
+        : '<span class="rounded-full bg-red-500/15 text-red-300 px-2.5 py-0.5 text-[10px] uppercase tracking-wider">'+esc(a.status)+'</span>');
+    const glow=isRun?'border-amber-500/40 shadow-[0_0_24px_rgba(251,191,36,0.18)]':(a.status==='ok'?'border-edge':'border-red-500/30');
+    return '<div class="rounded-xl border '+glow+' bg-panel p-4">'+
+      '<div class="flex items-start justify-between gap-2">'+
+        '<div class="truncate">'+
+          '<div class="text-sm font-semibold text-gray-200 truncate">'+esc(a.id)+'</div>'+
+          '<div class="text-xs text-accent mt-0.5">'+esc(a.provider)+'</div>'+
+        '</div>'+badge+
+      '</div>'+
+      '<div class="mt-3 flex justify-between text-[11px] text-gray-500">'+
+        '<span>'+(isRun?'working…':'<span class="text-gray-400">'+esc(a.seconds)+'s</span>')+'</span>'+
+        '<span>'+(isRun?'':esc(a.tokens)+' tok')+'</span>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+}
 async function poll(){
   try{
     const r=await fetch('/status.json');const s=await r.json();
     document.getElementById('phase').textContent=s.phase||'';
-    const ap=document.getElementById('approval');
-    if(s.approval&&s.approval.state==='pending'){
-      ap.className='pending';
-      document.getElementById('approval-issues').innerHTML='<ul>'+(s.approval.issues||[]).map(i=>
-        '<li>['+esc(i.severity||'?')+'] '+esc(i.path||'?')+': '+esc((i.problem||'').slice(0,140))+'</li>').join('')+'</ul>';
-    }else{ap.className='';}
-    document.getElementById('providers').innerHTML=(s.providers||[]).map(p=>'<tr><td>'+esc(p)+'</td></tr>').join('');
-    document.getElementById('agents').innerHTML=(s.agents||[]).map(a=>
-      '<tr><td>'+esc(a.id)+'</td><td>'+esc(a.provider)+'</td><td>'+
-      (a.status==='ok'?'<span class="badge ok">ok</span>':'<span class="badge fail">'+esc(a.status)+'</span>')+
-      '</td><td>'+esc(a.seconds)+'</td><td>'+esc(a.tokens)+'</td></tr>').join('');
+    if(s.task)document.getElementById('task-box').textContent=s.task;
+    renderPipeline(s);
+    renderAgents(s);
     document.getElementById('logs').textContent=(s.logs||[]).join('\\n');
+    const modal=document.getElementById('hitl-modal');
+    if(s.approval&&s.approval.state==='pending'){
+      document.getElementById('hitl-title').textContent='The reviewer found '+(s.approval.issues||[]).length+' issue(s). Proceed with Auto-Fix?';
+      document.getElementById('hitl-issues').innerHTML=(s.approval.issues||[]).map(i=>
+        '<li class="py-2 flex gap-3"><span class="text-[10px] uppercase tracking-wider mt-0.5 text-amber-400">'+esc(i.severity||'?')+'</span><span class="text-gray-300">'+esc((i.path||'?')+': '+(i.problem||''))+'</span></li>'
+      ).join('')||'<li class="py-2 text-gray-500">No issue details.</li>';
+      modal.classList.remove('hidden');
+    }else{
+      modal.classList.add('hidden');
+    }
   }catch(e){}
-    try{
-      const r=await fetch('/usage.json');const u=await r.json();
-      const total=u.rows.filter(x=>x.provider==='TOTAL');
-      if(total.length)document.getElementById('saved').textContent='$'+total[0].cost_saved_usd.toFixed(2);
-      document.getElementById('usage').innerHTML=(u.rows||[]).map(x=>
-        '<tr>'+ (x.provider==='TOTAL'?'<td><b>'+esc(x.provider)+'</b></td>':'<td>'+esc(x.provider)+'</td>') +
-        '<td>'+esc(x.runs)+'</td><td>'+esc(x.tokens)+
-        '</td><td>'+esc(x.today)+'</td><td>'+esc(x.limit)+'</td><td>'+
-        (x.cost_saved_usd>0?'$'+x.cost_saved_usd.toFixed(2):'-')+'</td></tr>').join('');
-    }catch(e){}
+  try{
+    const r=await fetch('/usage.json');const u=await r.json();
+    const total=u.rows.filter(x=>x.provider==='TOTAL');
+    if(total.length)document.getElementById('saved').textContent='$'+total[0].cost_saved_usd.toFixed(2);
+    document.getElementById('usage').innerHTML=(u.rows||[]).map(x=>
+      '<tr class="'+(x.provider==='TOTAL'?'bg-black/20 font-bold text-gray-100':'text-gray-400')+'">'+
+      '<td class="px-5 py-2">'+esc(x.provider)+'</td>'+
+      '<td class="px-3 py-2">'+esc(x.runs)+'</td>'+
+      '<td class="px-3 py-2">'+esc(x.tokens)+'</td>'+
+      '<td class="px-3 py-2">'+esc(x.today)+'</td>'+
+      '<td class="px-3 py-2">'+esc(x.limit)+'</td>'+
+      '<td class="px-5 py-2 text-right text-emerald-300">'+(x.cost_saved_usd>0?'$'+x.cost_saved_usd.toFixed(2):'-')+'</td>'+
+      '</tr>').join('');
+  }catch(e){}
 }
-setInterval(poll,1200);poll();
+setInterval(poll,1000);poll();
 </script>
 </body>
+</html>
 </html>"""
 
 

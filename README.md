@@ -88,7 +88,8 @@ SwarmForge ships with a native desktop GUI built on **tkinter** (Python's stdlib
 swarmforge --gui     # or: swarmforge-gui
 ```
 
-The GUI gives you a task box, all the pipeline options (quick / scaffold / no-plan / no-review,
+The GUI gives you a task box, all the pipeline options (quick / scaffold / no-plan / no-review /
+**HITL** human-in-the-loop approvals,
 model overrides, timeout, parallelism), a config picker, live agent status, a scrolling console,
 per-provider usage, plus buttons to check installed tools, **auto-install missing CLIs**, a
 **Settings** window (advanced: override per-tool binary paths / bin dir), open the workspace
@@ -163,6 +164,25 @@ python forge.py "..." --timeout 1800 --max-parallel 6
 ```
 
 > The `forge.py` shim and the installed `swarmforge` command accept exactly the same flags.
+
+## Live web dashboard (`--serve`)
+
+`--serve` starts a zero-dependency dashboard on `http://127.0.0.1:8787` (override with
+`--serve 9000`). It is a single `index.html` (Tailwind via CDN + vanilla JS polling
+`/status.json` every second) served straight from the stdlib `http.server` — no npm, no
+build step:
+
+- **Glowing cost-saved banner** — Feature #1's "Estimated API cost saved" metric.
+- **Pipeline visualizer** — Plan ➔ Scaffold ➔ Build ➔ Review ➔ Fix ➔ Report; the current
+  phase pulses (amber while waiting for human approval).
+- **Agent grid** — live cards per agent showing provider + subtask, with a spinning
+  loader while it runs (`running` is written to `status.json`), then `ok`/error badges.
+- **HITL popup** — when a review is pending approval the page shows a modal with the
+  issues and **Approve Fix** / **Skip Fixes** buttons that hit `/approve?decision=...`.
+- **Usage table + live logs** — same `$ saved` ledger, streaming log tail.
+
+Endpoints: `/` (dashboard), `/status.json`, `/usage.json`, `/approve?decision=fix|skip|no`,
+plus `/out/...` and `/memory/...` for the raw output files.
 
 ## Usage ledger & quotas
 

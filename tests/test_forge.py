@@ -572,5 +572,77 @@ class TestGui(unittest.TestCase):
         self.assertIn("--gui", buf.getvalue())
 
 
+class TestDashboard(unittest.TestCase):
+    def test_livestatus_running_tracking(self):
+        from swarmforge import LiveStatus
+        with tempfile.TemporaryDirectory() as tmp:
+            status = LiveStatus(str(tmp))
+            status.agent_started("t1", "mocka")
+            status.agent_started("t2", "mockb")
+            data = json.loads((Path(tmp) / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(data["running"]), 2)
+            self.assertEqual(data["running"][0]["provider"], "mocka")
+            status.agent_finished("t1")
+            data = json.loads((Path(tmp) / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual([r["id"] for r in data["running"]], ["t2"])
+
+    def test_dashboard_html_served(self):
+        import socket
+        import urllib.request as _ur
+        from swarmforge import serve
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            (ws / "status.json").write_text(
+                json.dumps({"phase": "building", "running": [], "agents": []}),
+                encoding="utf-8")
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            serve(str(ws), port)
+            html = _ur.urlopen(f"http://127.0.0.1:{port}/").read().decode("utf-8")
+            self.assertIn("cdn.tailwindcss.com", html)
+            self.assertIn("agents-grid", html)
+            self.assertIn("hitl-modal", html)
+            self.assertIn("Estimated API cost saved", html)
+            st = json.loads(_ur.urlopen(f"http://127.0.0.1:{port}/status.json").read())
+            self.assertEqual(st["phase"], "building")
+
+    def test_approve_endpoint_resolves_gate(self):
+        import socket
+        import urllib.request as _ur
+        from swarmforge import clear_approval_registry, get_gate, serve
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ws = Path(tmp) / "ws"
+                ws.mkdir()
+                (ws / "status.json").write_text(
+                    json.dumps({"phase": "awaiting_approval"}),
+                    encoding="utf-8")
+                s = socket.socket()
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+                s.close()
+                serve(str(ws), port)
+                gate = get_gate(str(ws))
+                gate.request([{"severity": "low"}])
+                _ur.urlopen(f"http://127.0.0.1:{port}/approve?decision=fix").read()
+                self.assertEqual(gate.wait(2), "fix")
+        finally:
+            clear_approval_registry()
+
+    def test_pipeline_records_running_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            rc = main(["Build a todo web app",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            status = json.loads((ws / "status.json").read_text(encoding="utf-8"))
+            self.assertIn("running", status)
+            self.assertEqual(status["running"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
