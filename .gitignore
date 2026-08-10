@@ -1,14 +1,28 @@
 # SwarmForge — generated at runtime
 runs/
 
+# SwarmForge runtime artifacts (match at any depth inside a workspace)
+memory/
+out/
+project/
+_meta/
+status.json
+usage.json
+report.json
+REPORT.md
+gcheck.txt
+
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.egg-info/
 .venv/
 venv/
 env/
+
+# Local CLI installs (created during testing)
+bin/
 
 # OS
 .DS_Store
