@@ -935,7 +935,8 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
     (shared / "task.md").write_text(task, encoding="utf-8")
     used: dict = {}
     status = LiveStatus(workspace)
-    status.set(phase="detecting", task=task, providers=sorted(avail))
+    status.set(phase="detecting", task=task, providers=sorted(avail),
+               workspace=workspace)
 
     print(f"\nSwarmForge {VERSION} - workspace: {workspace}\n")
     print("Detected providers:")
@@ -1118,8 +1119,18 @@ def main(argv=None):
                     help="Bootstrap a shared project tree first; all subtasks build inside it")
     ap.add_argument("--stats", action="store_true",
                     help="Show the token-usage dashboard (global ledger) and exit")
+    ap.add_argument("--gui", action="store_true",
+                    help="Open the desktop GUI (tkinter) instead of the CLI")
     ap.add_argument("--version", action="version", version=f"SwarmForge {VERSION}")
     args = ap.parse_args(argv)
+
+    if args.gui:
+        try:
+            from swarmforge.gui import main as gui_main
+        except Exception as e:  # noqa: BLE001
+            print(f"[x] GUI start nahi hua (tkinter missing?): {e}")
+            return 1
+        return gui_main(cfg_path=args.config)
 
     cfg_path = find_config(args.config)
     try:

@@ -316,5 +316,20 @@ class TestScaffold(unittest.TestCase):
             self.assertEqual(len(plan), 2)
 
 
+class TestGui(unittest.TestCase):
+    def test_gui_module_importable(self):
+        import swarmforge.gui as gui
+        self.assertTrue(callable(gui.main))
+        self.assertTrue(hasattr(gui, "App"))
+
+    def test_gui_flag_present(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            main(["--help"])
+        self.assertIn("--gui", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

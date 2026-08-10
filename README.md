@@ -77,6 +77,19 @@ swarmforge "Build me a todo web app"
 Either way a workspace folder (`runs/<task>-<timestamp>/`) is created with:
 `memory/` (shared context + logs), `out/` (each agent's files), and `REPORT.md` (final summary).
 
+## Desktop GUI
+
+SwarmForge ships with a native desktop GUI built on **tkinter** (Python's stdlib — still zero extra dependencies).
+
+```bash
+swarmforge --gui     # or: swarmforge-gui
+```
+
+The GUI gives you a task box, all the pipeline options (quick / scaffold / no-plan / no-review,
+model overrides, timeout, parallelism), a config picker, live agent status, a scrolling console,
+per-provider usage, plus buttons to check installed tools, open the workspace folder, and view the
+final report — no terminal required.
+
 ## Usage
 
 ```bash
@@ -207,6 +220,7 @@ The review/fix loop runs up to 2 rounds and stops as soon as a review is clean.
 SwarmForge/
 ├── swarmforge/             # the package (pip install -e . for the `swarmforge` command)
 │   ├── __init__.py         # the whole orchestrator (stdlib only)
+│   ├── gui.py              # desktop GUI (tkinter)
 │   └── __main__.py         # enables `python -m swarmforge`
 ├── forge.py                # tiny shim -> swarmforge (backward-compatible)
 ├── agents.json             # tool + role configuration

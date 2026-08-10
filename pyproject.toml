@@ -18,6 +18,7 @@ classifiers = [
 
 [project.scripts]
 swarmforge = "swarmforge:main"
+swarmforge-gui = "swarmforge.gui:main"
 
 [tool.setuptools]
 packages = ["swarmforge"]
