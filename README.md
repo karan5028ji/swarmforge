@@ -321,6 +321,29 @@ SwarmForge/
 └── runs/                   # generated workspaces (gitignored)
 ```
 
+## Rich report diffing (`📝 Code Changes`)
+
+Every run snapshots the output tree before the build phase, then again after review/fix, and
+writes line-level unified diffs into `REPORT.md` as GitHub-rendered ```diff blocks:
+
+```bash
+## 📝 Code Changes
+
+```diff
+--- a/app.py
++++ b/app.py
+@@ -1,3 +1,4 @@
+ def add(a, b):
+-    return a + b
++    return a * b
++
++print(add(2, 3))
+```
+
+`report.json` also records per-file `additions`/`deletions` counts under `"diffs"`. Binary files,
+`_meta`, and oversized files (≥512 KB) are skipped; only the actual output tree is diffed
+(baseline is taken after scaffolding, so scaffold-created files don't count as changes).
+
 ## Testing
 
 SwarmForge ships with mock agents so you can verify the full pipeline without any real AI tool:
@@ -349,7 +372,7 @@ python forge.py "Build a todo web app" --config tests/test-config.json --dir run
 - [x] Zero-setup: desktop-app detection + background CLI auto-install
 - [x] Estimated cost saved (ROI metric) in report / stats / dashboard / GUI
 - [ ] `--model` / `--provider` pinning for a *specific* subtask id
-- [ ] Rich report diffing between runs
+- [x] Rich report diffing (📝 Code Changes: baseline → after, per run)
 
 ## License
 

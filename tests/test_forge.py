@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from swarmforge import (  # noqa: E402
     build_command,
     build_phase,
     clear_approval_registry,
+    compute_diffs,
     cost_rate,
     desktop_apps,
     detect,
@@ -35,7 +37,9 @@ from swarmforge import (  # noqa: E402
     render_usage,
     resolve_binary,
     save_settings,
+    snapshot_tree,
     total_cost_saved,
+    unified_diff,
     usage_path,
 )
 
@@ -555,6 +559,73 @@ class TestCostSaved(unittest.TestCase):
                                 "cost_per_million_tokens": 5.0}}
             ledger = load_usage(cfg)
             render_usage(cfg, {"mocka": {"available": True}}, ledger)
+
+
+class TestDiff(unittest.TestCase):
+    def test_unified_diff_adds_removes_context(self):
+        before = ["def add(a, b):", "    return a + b", "", "print(add(1, 2))"]
+        after = ["def add(a, b):", "    return a * b", "", "print(add(2, 3))", "print('bye')"]
+        d = unified_diff(before, after)
+        self.assertTrue(any(x.startswith("@@ -1,") for x in d))
+        self.assertIn("-    return a + b", d)
+        self.assertIn("+    return a * b", d)
+        self.assertIn("+print('bye')", d)
+        self.assertIn(" def add(a, b):", d)  # unchanged context
+
+    def test_unified_diff_identical_returns_empty(self):
+        self.assertEqual(unified_diff(["a", "b"], ["a", "b"]), [])
+
+    def test_unified_diff_big_file_fallback(self):
+        before = [f"line {i}" for i in range(500)]
+        after = [f"line {i}!" for i in range(500)]
+        d = unified_diff(before, after)
+        self.assertEqual(sum(1 for x in d if x.startswith("-")), 500)
+        self.assertEqual(sum(1 for x in d if x.startswith("+")), 500)
+
+    def test_snapshot_tree_skips_binary_and_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("print(1)\n", encoding="utf-8")
+            (root / "bin.dat").write_bytes(b"\x00\x01\x02")
+            meta = root / "_meta" / "t1"
+            meta.mkdir(parents=True)
+            (meta / "result.json").write_text("{}", encoding="utf-8")
+            snap = snapshot_tree(root)
+            self.assertEqual(snap, {"app.py": "print(1)\r\n" if os.linesep == "\r\n" else "print(1)\n"})
+
+    def test_compute_diffs_skips_unchanged(self):
+        before = {"a.py": "x\n", "b.py": "old\n"}
+        after = {"a.py": "x\n", "b.py": "new\n", "c.py": "brand new\n"}
+        diffs = compute_diffs(before, after)
+        paths = [d["path"] for d in diffs]
+        self.assertEqual(paths, ["b.py", "c.py"])
+        self.assertEqual(diffs[1]["additions"], 1)
+        self.assertEqual(diffs[0]["deletions"], 1)
+
+    def test_report_contains_code_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            rc = main(["Build a todo web app",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            md = (ws / "REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("\U0001F4DD Code Changes", md)
+            self.assertIn("```diff", md)
+            self.assertIn("+++ b/", md)
+            rj = json.loads((ws / "report.json").read_text(encoding="utf-8"))
+            self.assertTrue(rj["diffs"])
+            self.assertEqual(rj["diffs"][0]["additions"], 1)
+
+    def test_scaffold_run_diffs_existing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            rc = main(["Build a todo web app", "--scaffold",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            rj = json.loads((ws / "report.json").read_text(encoding="utf-8"))
+            self.assertTrue(rj["diffs"])
 
 
 class TestGui(unittest.TestCase):

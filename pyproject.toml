@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swarmforge"
-version = "0.4.3"
+version = "0.4.4"
 description = "Route one task across every free AI coding agent on your machine. No API keys, zero dependencies."
 readme = "README.md"
 license = { text = "MIT" }

@@ -30,7 +30,7 @@ import urllib.parse as _urllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 CONFIG_NAME = "agents.json"
 
 # --------------------------------------------------------------------------
@@ -1093,8 +1093,167 @@ def load_results(outroot: Path) -> dict:
     return results
 
 
+# --------------------------------------------------------------------------
+# Rich report diffing (before/after snapshots -> unified diffs in REPORT.md)
+# --------------------------------------------------------------------------
+
+_MAX_DIFF_FILE_BYTES = 512 * 1024
+_MAX_DIFF_LINES = 4000
+
+
+def snapshot_tree(root: Path) -> dict:
+    """Capture every text file's content under `root` -> {relpath: text}.
+
+    Binary files, agent metadata and oversized files are skipped so the
+    before/after comparison stays cheap and meaningful.
+    """
+    snap: dict = {}
+    if not root or not root.exists():
+        return snap
+    for f in sorted(root.rglob("*")):
+        if not f.is_file():
+            continue
+        if "_meta" in f.parts or f.name in ("agent.log", "result.json", "review.json"):
+            continue
+        try:
+            if f.stat().st_size > _MAX_DIFF_FILE_BYTES:
+                continue
+            raw = f.read_bytes()
+            if b"\x00" in raw[:8192]:
+                continue
+            snap[f.relative_to(root).as_posix()] = raw.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            continue
+    return snap
+
+
+def _lcs_pairs(a, b):
+    """Longest-common-subsequence (before_idx, after_idx) pairs, or None if too big."""
+    n, m = len(a), len(b)
+    if n * m > 1_000_000 or n > _MAX_DIFF_LINES or m > _MAX_DIFF_LINES:
+        return None
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        row, nxt = dp[i], dp[i + 1]
+        ai = a[i]
+        for j in range(m - 1, -1, -1):
+            row[j] = nxt[j + 1] + 1 if ai == b[j] else (nxt[j] if nxt[j] >= row[j + 1] else row[j + 1])
+    pairs = []
+    i = j = 0
+    while i < n and j < m:
+        if a[i] == b[j]:
+            pairs.append((i, j))
+            i += 1
+            j += 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
+def unified_diff(before_lines, after_lines, context=3):
+    """Generate unified-diff lines (with hunks) for two line lists."""
+    pairs = _lcs_pairs(before_lines, after_lines)
+    if pairs is None:
+        pairs = []  # fallback: treat everything as changed
+    ops = []
+    bi = aj = 0
+    for i, j in pairs:
+        while bi < i:
+            ops.append(("-", bi, -1))
+            bi += 1
+        while aj < j:
+            ops.append(("+", -1, aj))
+            aj += 1
+        ops.append((" ", i, j))
+        bi, aj = i + 1, j + 1
+    while bi < len(before_lines):
+        ops.append(("-", bi, -1))
+        bi += 1
+    while aj < len(after_lines):
+        ops.append(("+", -1, aj))
+        aj += 1
+    if not ops:
+        return []
+    n = len(ops)
+    pref_b = [0] * (n + 1)
+    pref_a = [0] * (n + 1)
+    for idx, (kind, _, _) in enumerate(ops):
+        pref_b[idx + 1] = pref_b[idx] + (1 if kind in (" ", "-") else 0)
+        pref_a[idx + 1] = pref_a[idx] + (1 if kind in (" ", "+") else 0)
+    groups = []
+    cur = None
+    for idx, (kind, _, _) in enumerate(ops):
+        if kind == " ":
+            continue
+        if cur is None or idx > cur[1] + 2 * context:
+            cur = [idx, idx]
+            groups.append(cur)
+        else:
+            cur[1] = idx
+    out = []
+    for s, e in groups:
+        cs = max(0, s - context)
+        ce = min(n - 1, e + context)
+        out.append(f"@@ -{pref_b[cs] + 1},{pref_b[ce + 1] - pref_b[cs]} "
+                   f"+{pref_a[cs] + 1},{pref_a[ce + 1] - pref_a[cs]} @@")
+        for idx in range(cs, ce + 1):
+            kind, bi_, aj_ = ops[idx]
+            if kind == " ":
+                out.append(" " + before_lines[bi_])
+            elif kind == "-":
+                out.append("-" + before_lines[bi_])
+            else:
+                out.append("+" + after_lines[aj_])
+    return out
+
+
+def compute_diffs(before: dict, after: dict) -> list:
+    """Per-file diffs for files that actually changed."""
+    diffs = []
+    for p in sorted(set(before) | set(after)):
+        a_text = before.get(p, "")
+        b_text = after.get(p, "")
+        if a_text == b_text:
+            continue
+        diff_lines = unified_diff(a_text.splitlines(), b_text.splitlines())
+        adds = sum(1 for dl in diff_lines if dl.startswith("+") and not dl.startswith("+++"))
+        dels = sum(1 for dl in diff_lines if dl.startswith("-") and not dl.startswith("---"))
+        diffs.append({"path": p, "diff": diff_lines, "additions": adds, "deletions": dels})
+    return diffs
+
+
+def render_code_changes(diffs) -> list:
+    """Markdown section with GitHub-flavoured ```diff blocks."""
+    lines = []
+    a = lines.append
+    a("## 📝 Code Changes")
+    a("")
+    if not diffs:
+        a("No files were changed by this run.")
+        a("")
+        return lines
+    total_adds = sum(d["additions"] for d in diffs)
+    total_dels = sum(d["deletions"] for d in diffs)
+    a(f"**{len(diffs)} file(s)** changed — "
+      f"`+{total_adds}` added, `-{total_dels}` removed (vs. the pre-build baseline).")
+    a("")
+    for d in diffs:
+        a(f"### `{d['path']}`  `+{d['additions']}` `-{d['deletions']}`")
+        a("")
+        a("```diff")
+        a(f"--- a/{d['path']}")
+        a(f"+++ b/{d['path']}")
+        for dl in d["diff"]:
+            a(dl)
+        a("```")
+        a("")
+    return lines
+
+
 def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = None,
-                 cfg: dict | None = None):
+                 cfg: dict | None = None, diffs: list | None = None):
     outroot = outroot or (ws / "out")
     cfg = cfg or {}
     rate = cost_rate(cfg)
@@ -1185,7 +1344,12 @@ def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = N
         else:
             a("- _(no files produced)_")
         a("")
+    if diffs is not None:
+        lines.extend(render_code_changes(diffs))
     (ws / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
+
+    diff_stats = ([{"path": d["path"], "additions": d["additions"], "deletions": d["deletions"]}
+                   for d in diffs] if diffs else [])
 
     report_json = {
         "generated": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -1199,6 +1363,7 @@ def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = N
              "tokens": results.get(s["id"], ({"tokens": 0}, "?"))[0].get("tokens", 0)}
             for s in plan],
         "issues": issues,
+        "diffs": diff_stats,
         "stats": {"per_provider": prov,
                   "total_tokens": total_tokens,
                   "total_seconds": round(sum(v["seconds"] for v in prov.values()), 1),
@@ -1541,6 +1706,8 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
         print(f"          - {s['id']}: {s['title']}  (depends: {deps})")
 
     # 2. BUILD (parallel waves by dependency) ------------------------------
+    baseline = snapshot_tree(outroot)
+    status.log(f"diff baseline captured: {len(baseline)} file(s)")
     results = build_phase(cfg, avail, used, task, shared, outroot, plan,
                           timeout, max_parallel, status, models)
 
@@ -1554,7 +1721,10 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
 
     # 4. REPORT ------------------------------------------------------------
     status.set(phase="reporting")
-    write_report(ws, task, plan, results, issues, outroot, cfg)
+    after = snapshot_tree(outroot)
+    diffs = compute_diffs(baseline, after)
+    status.log(f"code changes: {len(diffs)} file(s) modified")
+    write_report(ws, task, plan, results, issues, outroot, cfg, diffs=diffs)
     record_run_usage(cfg, ledger, results)
     status.set(phase="done")
     print(f"\n[report] {ws / 'REPORT.md'}")
@@ -1579,12 +1749,15 @@ def continue_pipeline(cfg, avail, workspace, args, timeout, ledger=None, models=
                subtasks=[s["id"] for s in plan], providers=sorted(avail))
 
     print(f"\nSwarmForge {VERSION} - resuming workspace: {workspace}\n")
+    baseline = snapshot_tree(outroot)
     issues = []
     if not args.no_review:
         issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout,
                                  status, models, getattr(args, "hitl", False),
                                  workspace)
-    write_report(ws, task, plan, results, issues, outroot, cfg)
+    after = snapshot_tree(outroot)
+    diffs = compute_diffs(baseline, after)
+    write_report(ws, task, plan, results, issues, outroot, cfg, diffs=diffs)
     record_run_usage(cfg, ledger, results)
     status.set(phase="done")
     print(f"\n[report] {ws / 'REPORT.md'}")
