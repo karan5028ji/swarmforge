@@ -29,7 +29,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 CONFIG_NAME = "agents.json"
 
 # --------------------------------------------------------------------------
@@ -37,7 +37,8 @@ CONFIG_NAME = "agents.json"
 # --------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    "defaults": {"timeout": 900, "max_parallel": 4, "bin_dir": ""},
+    "defaults": {"timeout": 900, "max_parallel": 4, "bin_dir": "",
+                 "cost_per_million_tokens": 5.0},
     "providers": {
         "opencode": {
             "binary": "opencode",
@@ -556,6 +557,39 @@ def estimate_tokens(prompt: str, output: str) -> int:
     return (len(prompt) + len(output)) // 4
 
 
+def cost_rate(cfg: dict) -> float:
+    """USD per million tokens used to price the work SwarmForge got for free.
+
+    Overridable via `defaults.cost_per_million_tokens` in the config.
+    Default $5 / 1M tokens ≈ a blended OpenAI mid-range model price.
+    """
+    try:
+        rate = float(cfg.get("defaults", {}).get("cost_per_million_tokens", 5.0))
+    except (TypeError, ValueError):
+        rate = 5.0
+    return rate
+
+
+def estimated_cost(tokens: int, cfg: dict | None = None) -> float:
+    """Dollar cost those tokens would have had on a paid API (full precision)."""
+    rate = cost_rate(cfg) if cfg else 5.0
+    return round(tokens * rate / 1_000_000, 6)
+
+
+def format_cost(dollars: float) -> str:
+    if dollars <= 0:
+        return "$0.00"
+    if dollars < 0.01:
+        return "<$0.01"
+    return f"${dollars:,.2f}"
+
+
+def total_cost_saved(cfg: dict, ledger: dict) -> float:
+    """Total $ saved per the global usage ledger (all providers)."""
+    return round(sum(estimated_cost(e.get("tokens", 0), cfg)
+                     for e in ledger.get("providers", {}).values()), 2)
+
+
 def pick_provider(role: str, avail: dict, used: dict, cfg: dict):
     role_cfg = cfg.get("roles", {}).get(role, {})
     candidates = [p for p in role_cfg.get("providers", []) if p in avail]
@@ -738,16 +772,20 @@ def filter_quota(cfg: dict, avail: dict, ledger: dict):
 
 def render_usage(cfg: dict, det: dict, ledger: dict):
     today = _dt.date.today().isoformat()
+    rate = cost_rate(cfg)
     print("\nSwarmForge - usage dashboard\n")
     print(f"Ledger: {usage_path(cfg)}\n")
     names = sorted(set(list(ledger["providers"]) + list(det)))
     print(f"  {'provider':<12} {'runs':>5} {'est. tokens':>12} {'today':>10} "
-          f"{'daily limit':>12}  status")
+          f"{'daily limit':>12}  {'$ saved':>10}  status")
+    total_tokens = 0
     for name in names:
         entry = ledger["providers"].get(name, {})
         day_tokens = entry.get("day_tokens", 0) if entry.get("day") == today else 0
         limit = det.get(name, {}).get("quota", {}).get("daily_tokens")
         limit_s = str(limit) if limit else "-"
+        saved = estimated_cost(entry.get("tokens", 0), cfg)
+        total_tokens += entry.get("tokens", 0)
         if name in det:
             status = "available" if det[name]["available"] else "not installed"
         else:
@@ -758,7 +796,10 @@ def render_usage(cfg: dict, det: dict, ledger: dict):
             pct = day_tokens * 100 // limit
             status = f"{pct}% used"
         print(f"  {name:<12} {entry.get('runs', 0):>5} {entry.get('tokens', 0):>12,} "
-              f"{day_tokens:>10,} {limit_s:>12}  {status}")
+              f"{day_tokens:>10,} {limit_s:>12}  {format_cost(saved):>10}  {status}")
+    print(f"\n  Total tokens processed: {total_tokens:,} "
+          f"-> estimated cost saved: {format_cost(total_cost_saved(cfg, ledger))}"
+          f" (@ ${rate:g}/1M tokens)")
 
 
 # --------------------------------------------------------------------------
@@ -920,8 +961,11 @@ def load_results(outroot: Path) -> dict:
     return results
 
 
-def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = None):
+def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = None,
+                 cfg: dict | None = None):
     outroot = outroot or (ws / "out")
+    cfg = cfg or {}
+    rate = cost_rate(cfg)
     lines = []
     a = lines.append
     a("# SwarmForge Report")
@@ -967,6 +1011,20 @@ def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = N
     a("")
     a(f"**Total estimated tokens:** {total_tokens}")
     a("")
+    saved = estimated_cost(total_tokens, cfg)
+    a("## Cost Saved")
+    a("")
+    a(f"**Estimated cost saved:** {format_cost(saved)}")
+    a("")
+    a(f"These {total_tokens:,} tokens were processed for free across your installed AI CLIs. "
+      f"At a blended {rate:g}/1M-token rate (OpenAI-class API pricing), the same work would have "
+      f"cost roughly {format_cost(saved)} on a paid API. Zero API keys. Zero paid tokens.")
+    a("")
+    a("| provider | est. tokens | $ saved |")
+    a("|----------|------------:|--------:|")
+    for pname, agg in prov.items():
+        a(f"| {pname} | {agg['tokens']:,} | {format_cost(estimated_cost(agg['tokens'], cfg))} |")
+    a("")
     a("## Review")
     a("")
     if issues:
@@ -1011,7 +1069,9 @@ def write_report(ws: Path, task, plan, results, issues, outroot: Path | None = N
         "issues": issues,
         "stats": {"per_provider": prov,
                   "total_tokens": total_tokens,
-                  "total_seconds": round(sum(v["seconds"] for v in prov.values()), 1)},
+                  "total_seconds": round(sum(v["seconds"] for v in prov.values()), 1),
+                  "cost_saved_usd": estimated_cost(total_tokens, cfg),
+                  "cost_rate_per_million": rate},
     }
     (ws / "report.json").write_text(
         json.dumps(report_json, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1032,6 +1092,7 @@ DASHBOARD_HTML = """<!doctype html>
   .sub{color:#6b7280;font-size:12px;margin-bottom:20px}
   .badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;margin-left:8px}
   .ok{background:#123524;color:#4ade80}.run{background:#1e1b4b;color:#a5b4fc}.fail{background:#3b0d17;color:#f87171}
+  .saved{background:#0c3b2e;color:#4ade80;padding:8px 14px;border-radius:8px;display:inline-block;font-size:13px;font-weight:600;margin-bottom:14px}
   table{border-collapse:collapse;width:100%;margin-bottom:24px;font-size:13px}
   th,td{border-bottom:1px solid #1f2430;text-align:left;padding:8px 10px}
   th{color:#8b5cf6;font-weight:600}
@@ -1043,6 +1104,7 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
 <h1>SwarmForge</h1>
 <div class="sub">multi-agent build in progress — <span id="phase">...</span></div>
+<div><span class="saved">Estimated API cost saved: <span id="saved">$0.00</span> (free-tier)</span></div>
 <table>
   <thead><tr><th>provider</th></tr></thead>
   <tbody id="providers"></tbody>
@@ -1054,7 +1116,7 @@ DASHBOARD_HTML = """<!doctype html>
 </table>
 <h2>Usage</h2>
 <table>
-  <thead><tr><th>provider</th><th>runs</th><th>est. tokens</th><th>today</th><th>daily limit</th></tr></thead>
+  <thead><tr><th>provider</th><th>runs</th><th>est. tokens</th><th>today</th><th>daily limit</th><th>$ saved</th></tr></thead>
   <tbody id="usage"></tbody>
 </table>
 <h2>Logs</h2>
@@ -1072,12 +1134,16 @@ async function poll(){
       '</td><td>'+esc(a.seconds)+'</td><td>'+esc(a.tokens)+'</td></tr>').join('');
     document.getElementById('logs').textContent=(s.logs||[]).join('\\n');
   }catch(e){}
-  try{
-    const r=await fetch('/usage.json');const u=await r.json();
-    document.getElementById('usage').innerHTML=(u.rows||[]).map(x=>
-      '<tr><td>'+esc(x.provider)+'</td><td>'+esc(x.runs)+'</td><td>'+esc(x.tokens)+
-      '</td><td>'+esc(x.today)+'</td><td>'+esc(x.limit)+'</td></tr>').join('');
-  }catch(e){}
+    try{
+      const r=await fetch('/usage.json');const u=await r.json();
+      const total=u.rows.filter(x=>x.provider==='TOTAL');
+      if(total.length)document.getElementById('saved').textContent='$'+total[0].cost_saved_usd.toFixed(2);
+      document.getElementById('usage').innerHTML=(u.rows||[]).map(x=>
+        '<tr>'+ (x.provider==='TOTAL'?'<td><b>'+esc(x.provider)+'</b></td>':'<td>'+esc(x.provider)+'</td>') +
+        '<td>'+esc(x.runs)+'</td><td>'+esc(x.tokens)+
+        '</td><td>'+esc(x.today)+'</td><td>'+esc(x.limit)+'</td><td>'+
+        (x.cost_saved_usd>0?'$'+x.cost_saved_usd.toFixed(2):'-')+'</td></tr>').join('');
+    }catch(e){}
 }
 setInterval(poll,1200);poll();
 </script>
@@ -1094,14 +1160,21 @@ def serve(workspace: str, port: int, cfg: dict | None = None):
     def usage_rows():
         today = _dt.date.today().isoformat()
         rows = []
+        total_tokens = 0
         names = sorted(set(list(ledger["providers"]) + list(det)))
         for name in names:
             entry = ledger["providers"].get(name, {})
             day_tokens = entry.get("day_tokens", 0) if entry.get("day") == today else 0
             limit = det.get(name, {}).get("quota", {}).get("daily_tokens")
+            tokens = entry.get("tokens", 0)
+            total_tokens += tokens
             rows.append({"provider": name, "runs": entry.get("runs", 0),
-                         "tokens": entry.get("tokens", 0),
-                         "today": day_tokens, "limit": limit or ""})
+                         "tokens": tokens,
+                         "today": day_tokens, "limit": limit or "",
+                         "cost_saved_usd": estimated_cost(tokens, cfg)})
+        rows.append({"provider": "TOTAL", "runs": "", "tokens": total_tokens,
+                     "today": "", "limit": "",
+                     "cost_saved_usd": total_cost_saved(cfg, ledger)})
         return rows
 
     class Handler(BaseHTTPRequestHandler):
@@ -1220,7 +1293,7 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
 
     # 4. REPORT ------------------------------------------------------------
     status.set(phase="reporting")
-    write_report(ws, task, plan, results, issues, outroot)
+    write_report(ws, task, plan, results, issues, outroot, cfg)
     record_run_usage(cfg, ledger, results)
     status.set(phase="done")
     print(f"\n[report] {ws / 'REPORT.md'}")
@@ -1249,7 +1322,7 @@ def continue_pipeline(cfg, avail, workspace, args, timeout, ledger=None, models=
     if not args.no_review:
         issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout,
                                  status, models)
-    write_report(ws, task, plan, results, issues, outroot)
+    write_report(ws, task, plan, results, issues, outroot, cfg)
     record_run_usage(cfg, ledger, results)
     status.set(phase="done")
     print(f"\n[report] {ws / 'REPORT.md'}")

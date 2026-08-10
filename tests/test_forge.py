@@ -11,11 +11,14 @@ from swarmforge import (  # noqa: E402
     bin_dir,
     build_command,
     build_phase,
+    cost_rate,
     desktop_apps,
     detect,
     estimate_tokens,
+    estimated_cost,
     extract_json_array,
     filter_quota,
+    format_cost,
     load_usage,
     load_config,
     main,
@@ -26,6 +29,7 @@ from swarmforge import (  # noqa: E402
     render_usage,
     resolve_binary,
     save_settings,
+    total_cost_saved,
     usage_path,
 )
 
@@ -393,6 +397,56 @@ class TestAutoInstall(unittest.TestCase):
             rc = main(["--auto-install",
                        "--config", str(ROOT / "tests" / "test-config.json")])
             self.assertEqual(rc, 0)
+
+
+class TestCostSaved(unittest.TestCase):
+    def test_estimated_cost_default_rate(self):
+        self.assertEqual(estimated_cost(1_000_000), 5.0)
+        self.assertEqual(estimated_cost(100_000), 0.5)
+        self.assertEqual(estimated_cost(0), 0.0)
+
+    def test_estimated_cost_custom_rate(self):
+        cfg = {"defaults": {"cost_per_million_tokens": 2.0}}
+        self.assertEqual(estimated_cost(500_000, cfg), 1.0)
+
+    def test_cost_rate_fallback_on_bad_value(self):
+        cfg = {"defaults": {"cost_per_million_tokens": "not-a-number"}}
+        self.assertEqual(cost_rate(cfg), 5.0)
+
+    def test_format_cost(self):
+        self.assertEqual(format_cost(0), "$0.00")
+        self.assertEqual(format_cost(0.45), "$0.45")
+        self.assertEqual(format_cost(1234.5), "$1,234.50")
+        self.assertEqual(format_cost(0.001), "<$0.01")
+
+    def test_total_cost_saved_from_ledger(self):
+        cfg = {"defaults": {"cost_per_million_tokens": 5.0}}
+        ledger = {"providers": {"a": {"tokens": 600_000},
+                                "b": {"tokens": 400_000}}}
+        self.assertEqual(total_cost_saved(cfg, ledger), 5.0)
+
+    def test_report_contains_cost_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            ws = tmp / "ws"
+            rc = main(["Build a todo web app",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            report_md = (ws / "REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("Cost Saved", report_md)
+            self.assertIn("estimated cost saved", report_md.lower())
+            report = json.loads((ws / "report.json").read_text(encoding="utf-8"))
+            self.assertIn("cost_saved_usd", report["stats"])
+            self.assertIn("cost_rate_per_million", report["stats"])
+
+    def test_usage_dashboard_prints_cost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = {"defaults": {"usage_file": str(tmp / "usage.json"),
+                                "cost_per_million_tokens": 5.0}}
+            ledger = load_usage(cfg)
+            render_usage(cfg, {"mocka": {"available": True}}, ledger)
 
 
 class TestGui(unittest.TestCase):

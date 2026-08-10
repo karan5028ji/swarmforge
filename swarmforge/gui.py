@@ -27,12 +27,15 @@ from swarmforge import (  # noqa: E402
     bin_dir,
     desktop_apps,
     detect,
+    estimated_cost,
     find_config,
     filter_quota,
+    format_cost,
     load_config,
     load_usage,
     main as cli_main,
     resolve_binary,
+    total_cost_saved,
 )
 
 BG = "#0f1117"
@@ -189,14 +192,17 @@ class App(tk.Tk):
         self.prov_tree.pack(fill="x")
         ttk.Label(left, text="Usage (today)", style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
         self.usage_tree = ttk.Treeview(
-            left, columns=("runs", "tokens", "today", "limit"), height=8, show="tree headings")
+            left, columns=("runs", "tokens", "today", "limit", "cost"), height=8, show="tree headings")
         for col, txt, w in (("runs", "runs", 45), ("tokens", "tokens", 70),
-                            ("today", "today", 60), ("limit", "limit", 60)):
+                            ("today", "today", 60), ("limit", "limit", 60),
+                            ("cost", "$ saved", 75)):
             self.usage_tree.heading(col, text=txt)
             self.usage_tree.column(col, width=w, anchor="e")
         self.usage_tree.heading("#0", text="provider")
         self.usage_tree.column("#0", width=100)
         self.usage_tree.pack(fill="x")
+        self.usage_total_lbl = ttk.Label(left, text="", foreground=GREEN)
+        self.usage_total_lbl.pack(anchor="w", pady=(4, 0))
         paned.add(left, weight=1)
 
         right = ttk.Frame(paned)
@@ -378,7 +384,10 @@ class App(tk.Tk):
             limit = det.get(name, {}).get("quota", {}).get("daily_tokens", "")
             self.usage_tree.insert("", "end", text=name,
                                    values=(entry.get("runs", 0), entry.get("tokens", 0),
-                                           day_tokens, limit or ""))
+                                           day_tokens, limit or "",
+                                           format_cost(estimated_cost(entry.get("tokens", 0), cfg))))
+        self.usage_total_lbl.configure(
+            text=f"Total cost saved: {format_cost(total_cost_saved(cfg, ledger))}")
 
     def show_usage(self):
         try:

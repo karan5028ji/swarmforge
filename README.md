@@ -167,7 +167,8 @@ Every run records estimated token/time usage per provider into a **global ledger
 (`%APPDATA%\swarmforge\usage.json` on Windows, `~/.config/swarmforge/usage.json` elsewhere;
 override with `"defaults": { "usage_file": "..." }` in the config).
 
-- `swarmforge --stats` prints a dashboard: runs, est. tokens, today's tokens, and quota status.
+- `swarmforge --stats` prints a dashboard: runs, est. tokens, today's tokens, quota status, and
+  **estimated cost saved**.
 - A provider can declare a daily token cap:
 
 ```jsonc
@@ -181,6 +182,24 @@ override with `"defaults": { "usage_file": "..." }` in the config).
 
 - When a provider's `day_tokens` reaches its `daily_tokens` cap, SwarmForge **skips it** for the
   rest of the day and prints a warning. The live dashboard (`--serve`) shows the same usage table.
+
+## Estimated cost saved (the ROI hook)
+
+Every token SwarmForge processes for free is priced at a blended **$5 per 1M tokens**
+(OpenAI-class API pricing) and shown as **"estimated cost saved"**:
+
+- `REPORT.md` gets a **Cost Saved** section: total `$` saved, the rate used, and a
+  per-provider `$ saved` table.
+- `report.json` → `stats.cost_saved_usd` and `stats.cost_rate_per_million`.
+- `swarmforge --stats` and the live dashboard (`--serve`) show a `$ saved` column plus a running
+  **TOTAL** row and a big cost-saved banner.
+- The GUI usage panel shows per-provider `$ saved` and a `Total cost saved` line.
+
+Override the rate in the config (`defaults.cost_per_million_tokens`), e.g.:
+
+```jsonc
+"defaults": { "cost_per_million_tokens": 3.0 }   // your own blended rate
+```
 
 ## Supported agents (auto-detected)
 
@@ -286,6 +305,7 @@ python forge.py "Build a todo web app" --config tests/test-config.json --dir run
 - [x] Token/quota usage dashboard
 - [x] Auto-init of a fresh project scaffold for the whole swarm
 - [x] Zero-setup: desktop-app detection + background CLI auto-install
+- [x] Estimated cost saved (ROI metric) in report / stats / dashboard / GUI
 - [ ] `--model` / `--provider` pinning for a *specific* subtask id
 - [ ] Rich report diffing between runs
 
