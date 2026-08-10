@@ -59,6 +59,9 @@ git clone <your-repo-url> && cd SwarmForge
 # 1. See what's available (and how to install what's missing)
 python forge.py --check
 
+# 1b. Zero-setup: auto-install every missing CLI companion (npm/PowerShell under the hood)
+python forge.py --auto-install
+
 # 2. Run your first task
 python forge.py "Build me a todo web app"
 
@@ -87,8 +90,31 @@ swarmforge --gui     # or: swarmforge-gui
 
 The GUI gives you a task box, all the pipeline options (quick / scaffold / no-plan / no-review,
 model overrides, timeout, parallelism), a config picker, live agent status, a scrolling console,
-per-provider usage, plus buttons to check installed tools, open the workspace folder, and view the
-final report — no terminal required.
+per-provider usage, plus buttons to check installed tools, **auto-install missing CLIs**, a
+**Settings** window (advanced: override per-tool binary paths / bin dir), open the workspace
+folder, and view the final report — no terminal required.
+
+## Zero-setup auto-install (desktop apps -> CLIs)
+
+SwarmForge detects which **desktop apps** you have installed (`opencode` desktop, Google
+Antigravity, ...) and installs their **CLI companions automatically** in the background — no
+manual setup:
+
+```bash
+swarmforge --auto-install   # one-shot: installs every missing CLI that has a recipe
+swarmforge "Build a todo app"   # same thing happens on demand if nothing is detected
+```
+
+- Install methods used under the hood: `npm` for opencode / gemini / copilot, the official
+  PowerShell installer for Antigravity's `agy`.
+- CLIs land in a per-user folder: `%LOCALAPPDATA%\swarmforge\bin\<tool>\` (override with
+  `"defaults": { "bin_dir": "..." }`). Your PATH is never touched — SwarmForge calls the
+  resolved binary directly.
+- `--check` shows what it found: `[ok]` = CLI ready, `[!]` = desktop app present + CLI will
+  auto-install, `[x]` = nothing found.
+- **Advanced users:** GUI **Settings** window (or a `swarmforge-settings.json` next to your
+  config) can pin a custom binary path per tool — e.g.
+  `"providers": { "opencode": { "binary_path": "C:/tools/opencode.exe" } }`.
 
 ## Usage
 
@@ -259,6 +285,7 @@ python forge.py "Build a todo web app" --config tests/test-config.json --dir run
 - [x] `--model` CLI override per role
 - [x] Token/quota usage dashboard
 - [x] Auto-init of a fresh project scaffold for the whole swarm
+- [x] Zero-setup: desktop-app detection + background CLI auto-install
 - [ ] `--model` / `--provider` pinning for a *specific* subtask id
 - [ ] Rich report diffing between runs
 

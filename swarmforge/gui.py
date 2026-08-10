@@ -22,13 +22,17 @@ except Exception:  # pragma: no cover - headless environments
 
 from swarmforge import (  # noqa: E402
     VERSION,
+    auto_install,
     available_providers,
+    bin_dir,
+    desktop_apps,
     detect,
     find_config,
     filter_quota,
     load_config,
     load_usage,
     main as cli_main,
+    resolve_binary,
 )
 
 BG = "#0f1117"
@@ -132,6 +136,8 @@ class App(tk.Tk):
                                   command=self.run)
         self.run_btn.pack(side="left")
         ttk.Button(btn_row, text="Check Tools", command=self.check_tools).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Install Missing CLIs", command=self.install_missing).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Settings", command=self.open_settings).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Usage", command=self.show_usage).pack(side="left", padx=6)
         ttk.Button(btn_row, text="Open Workspace", command=self.open_workspace).pack(side="left", padx=6)
         ttk.Button(btn_row, text="View Report", command=self.view_report).pack(side="left", padx=6)
@@ -264,10 +270,101 @@ class App(tk.Tk):
                 status = "ok"
                 if name in [e[0] for e in exhausted]:
                     status = "quota exhausted"
+            elif info.get("desktop_app"):
+                status = "desktop app - CLI missing"
             else:
                 status = "missing"
             self.prov_tree.insert("", "end", iid=name, text=name, values=(status,))
         self.refresh_usage(cfg)
+
+    def install_missing(self):
+        try:
+            _, cfg = self.get_cfg()
+        except Exception as e:
+            messagebox.showerror("Config", f"Config load nahi hui:\n{e}")
+            return
+        det = detect(cfg)
+        missing = [n for n, p in det.items()
+                   if not p["available"] and p.get("auto_install")]
+        if not missing:
+            messagebox.showinfo("Install", "Koi missing auto-installable CLI nahi hai.")
+            return
+        self.status_bar.configure(text="Installing missing CLIs...")
+        self.log_q.put(f"[gui] Installing: {', '.join(missing)}\n")
+
+        def worker():
+            for name in missing:
+                self.log_q.put(f"[gui] Installing {name}...\n")
+                path = auto_install(name, det[name])
+                if path:
+                    self.log_q.put(f"[gui] [ok] {name} -> {path}\n")
+                else:
+                    self.log_q.put(f"[gui] [x] {name} install failed\n")
+            self.log_q.put("[gui] Install complete. Re-checking tools...\n")
+            self.after(0, lambda: (self.check_tools(),
+                                   self.status_bar.configure(text="Ready")))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_settings(self):
+        try:
+            _, cfg = self.get_cfg()
+        except Exception as e:
+            messagebox.showerror("Config", f"Config load nahi hui:\n{e}")
+            return
+        win = tk.Toplevel(self)
+        win.title("Settings - binary paths")
+        win.geometry("640x520")
+        win.configure(bg=BG)
+        title = ttk.Label(win, text="Advanced: custom binary paths",
+                          style="Accent.TLabel")
+        title.pack(anchor="w", padx=12, pady=(10, 2))
+        ttk.Label(win, text="Default: PATH -> {ROOT} bin dir. "
+                            "Override below if CLI kisi aur jagah hai.",
+                  style="Muted.TLabel").pack(anchor="w", padx=12)
+        ttk.Label(win, text="Bin dir (default %LOCALAPPDATA%\\swarmforge\\bin)",
+                  style="Muted.TLabel").pack(anchor="w", padx=12, pady=(10, 0))
+        bin_var = tk.StringVar(value=str(bin_dir(cfg)))
+        bin_entry = ttk.Entry(win, textvariable=bin_var, width=70)
+        bin_entry.pack(anchor="w", padx=12)
+        ttk.Button(win, text="Browse...",
+                   command=lambda: bin_var.set(
+                       filedialog.askdirectory(title="Bin dir") or bin_var.get())
+                   ).pack(anchor="w", padx=12)
+
+        self._path_vars = {}
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+        for name in sorted(det):
+            row = ttk.Frame(body)
+            row.pack(fill="x", pady=3)
+            ttk.Label(row, text=f"{name}  ", width=10).pack(side="left")
+            var = tk.StringVar(value=(det[name].get("binary_path") or ""))
+            self._path_vars[name] = var
+            ttk.Entry(row, textvariable=var, width=58).pack(side="left", padx=4)
+            ttk.Label(row, text=f"(default: {det[name].get('binary')})",
+                      style="Muted.TLabel").pack(side="left")
+
+        def save():
+            from swarmforge import save_settings
+            overrides = {}
+            for name, var in self._path_vars.items():
+                val = var.get().strip()
+                if val:
+                    overrides[name] = {"binary_path": val}
+            binval = bin_var.get().strip()
+            dflts = {"bin_dir": binval} if binval else {}
+            cfg_path = self.cfg_var.get().strip() or self.cfg_path
+            from swarmforge import find_config
+            cfg_path = cfg_path or find_config(None)
+            if cfg_path:
+                from pathlib import Path
+                save_settings(Path(cfg_path), overrides, dflts)
+            win.destroy()
+            self.check_tools()
+            self.status_bar.configure(text="Settings saved (swarmforge-settings.json)")
+
+        ttk.Button(win, text="Save", style="Accent.TButton", command=save).pack(pady=8)
 
     def refresh_usage(self, cfg):
         today = __import__("datetime").date.today().isoformat()

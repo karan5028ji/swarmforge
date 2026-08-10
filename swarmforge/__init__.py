@@ -29,7 +29,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 CONFIG_NAME = "agents.json"
 
 # --------------------------------------------------------------------------
@@ -37,7 +37,7 @@ CONFIG_NAME = "agents.json"
 # --------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    "defaults": {"timeout": 900, "max_parallel": 4},
+    "defaults": {"timeout": 900, "max_parallel": 4, "bin_dir": ""},
     "providers": {
         "opencode": {
             "binary": "opencode",
@@ -48,6 +48,11 @@ DEFAULT_CONFIG = {
                 "npm": "npm i -g opencode-ai",
                 "curl": "curl -fsSL https://opencode.ai/install | bash",
             },
+            "auto_install": {
+                "method": "npm",
+                "package": "opencode-ai",
+                "binary": "opencode",
+            },
             "roles": ["planner", "scaffolder", "coder", "reviewer", "fixer"],
         },
         "agy": {
@@ -57,6 +62,15 @@ DEFAULT_CONFIG = {
             "approve_flags": ["--dangerously-skip-permissions"],
             "install": {
                 "curl": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+                "pwsh": "irm https://antigravity.google/cli/install.ps1 | iex",
+            },
+            "auto_install": {
+                "method": "pwsh",
+                "command": "irm https://antigravity.google/cli/install.ps1 | iex",
+                "binary": "agy",
+                "paths": ["%USERPROFILE%/.local/bin/agy.exe",
+                          "%LOCALAPPDATA%/agy/bin/agy.exe",
+                          "%LOCALAPPDATA%/Programs/antigravity/resources/agy.exe"],
             },
             "roles": ["planner", "scaffolder", "coder", "fixer"],
         },
@@ -66,6 +80,8 @@ DEFAULT_CONFIG = {
             "model_flag": ["--model"],
             "approve_flags": ["--yolo"],
             "install": {"npm": "npm i -g @google/gemini-cli"},
+            "auto_install": {"method": "npm", "package": "@google/gemini-cli",
+                             "binary": "gemini"},
             "roles": ["coder", "reviewer"],
         },
         "grok": {
@@ -82,6 +98,8 @@ DEFAULT_CONFIG = {
             "model_flag": [],
             "approve_flags": ["--yolo", "--no-ask-user"],
             "install": {"npm": "npm i -g @github/copilot"},
+            "auto_install": {"method": "npm", "package": "@github/copilot",
+                             "binary": "copilot"},
             "roles": ["coder", "fixer"],
         },
     },
@@ -248,25 +266,78 @@ def load_config(path: str | None) -> dict:
             return {k: sub(v) for k, v in o.items()}
         return o
 
-    return sub(cfg)
+    cfg = sub(cfg)
+    _merge_settings(cfg, p)
+    return cfg
+
+
+def _merge_settings(cfg: dict, cfg_path: Path):
+    """Overlay swarmforge-settings.json (next to the config) onto the config.
+
+    Advanced users (ya GUI settings) yahan binary_path / bin_dir overrides
+    likh sakte hain - source config touch nahi hota.
+    """
+    sp = cfg_path.with_name("swarmforge-settings.json")
+    try:
+        s = json.loads(sp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(s, dict):
+        return
+    defaults = cfg.setdefault("defaults", {})
+    if isinstance(s.get("defaults"), dict):
+        for k, v in s["defaults"].items():
+            if v not in (None, ""):
+                defaults[k] = v
+    for name, over in (s.get("providers") or {}).items():
+        if name not in cfg.get("providers", {}):
+            continue
+        if isinstance(over, dict):
+            for k, v in over.items():
+                if v not in (None, ""):
+                    cfg["providers"][name][k] = v
+
+
+def save_settings(cfg_path: Path, providers_overrides: dict, defaults: dict):
+    """Write swarmforge-settings.json next to the config."""
+    sp = cfg_path.with_name("swarmforge-settings.json")
+    data = {}
+    if defaults:
+        data["defaults"] = defaults
+    if providers_overrides:
+        data["providers"] = providers_overrides
+    sp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _expand(path: str) -> str:
+    s = os.path.expandvars(os.path.expanduser(str(path)))
+    for key, val in os.environ.items():
+        s = s.replace("{" + key + "}", val)
+        s = s.replace("%" + key + "%", val)
+    return s.replace("/", os.sep)
 
 
 def detect(cfg: dict) -> dict:
+    desktop = desktop_apps()
     out = {}
     for name, p in cfg.get("providers", {}).items():
         info = dict(p)
+        # Inject known auto-install recipes (defaults) so older configs work.
+        dflt = DEFAULT_CONFIG.get("providers", {}).get(name, {})
+        if not info.get("auto_install") and dflt.get("auto_install"):
+            info["auto_install"] = dflt["auto_install"]
         info["name"] = name
         info["available"] = False
         info["path"] = None
+        info["desktop_app"] = desktop.get(name)
+        info["_bin_dir"] = str(bin_dir(cfg))
         if p.get("always_available"):
             info["available"] = True
         else:
-            binary = p.get("binary")
-            if binary:
-                found = shutil.which(binary)
-                if found:
-                    info["available"] = True
-                    info["path"] = found
+            found = resolve_binary(name, info)
+            if found:
+                info["available"] = True
+                info["path"] = found
         out[name] = info
     return out
 
@@ -284,11 +355,169 @@ def install_commands(provider: dict):
 
 
 # --------------------------------------------------------------------------
+# Desktop-app detection + CLI auto-install
+# --------------------------------------------------------------------------
+
+def bin_dir(cfg: dict) -> Path:
+    """Where SwarmForge installs CLI binaries (default: %LOCALAPPDATA%\\swarmforge\\bin)."""
+    custom = cfg.get("defaults", {}).get("bin_dir")
+    if custom:
+        return Path(_expand(custom))
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA",
+                                   str(Path.home() / "AppData" / "Local")))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME",
+                                   str(Path.home() / ".local" / "share")))
+    return base / "swarmforge" / "bin"
+
+
+def desktop_apps() -> dict:
+    """Find installed desktop apps for known agents (opencode, antigravity, ...)."""
+    found = {}
+    candidates = {
+        "opencode": [
+            "{LOCALAPPDATA}/Programs/@opencode-aidesktop/OpenCode.exe",
+            "{LOCALAPPDATA}/Programs/@opencode-aidesktop/OpenCode.exe",
+            "{PROGRAMFILES}/OpenCode/OpenCode.exe",
+        ],
+        "agy": [
+            "{LOCALAPPDATA}/Programs/antigravity/Antigravity.exe",
+            "{LOCALAPPDATA}/Programs/antigravity/antigravity.exe",
+            "{PROGRAMFILES}/Antigravity/Antigravity.exe",
+        ],
+    }
+    for name, paths in candidates.items():
+        for p in paths:
+            expanded = _expand(p)
+            if expanded and Path(expanded).is_file():
+                found[name] = expanded
+                break
+    return found
+
+
+def _bin_candidates(provider: dict):
+    """Possible binary filenames for a provider (name, cmd shims, etc.)."""
+    names = set()
+    b = provider.get("binary")
+    if b:
+        names.add(b)
+    ai = provider.get("auto_install") or {}
+    if ai.get("binary"):
+        names.add(ai["binary"])
+    if provider.get("name"):
+        names.add(provider["name"])
+    if not names:
+        return []
+    out = []
+    for n in names:
+        base = n.replace(".exe", "").replace(".cmd", "")
+        out += [f"{base}.exe", f"{base}.cmd", f"{base}.bat", f"{base}.ps1", base]
+    return out
+
+
+def resolve_binary(name: str, provider: dict) -> str | None:
+    """Resolve a provider's CLI binary, honoring an explicit path override first."""
+    override = provider.get("binary_path") or provider.get("path")
+    if override:
+        p = Path(_expand(str(override)))
+        if p.is_file():
+            return str(p)
+    binary = provider.get("binary")
+    if binary:
+        found = shutil.which(binary)
+        if found:
+            return found
+    ai = provider.get("auto_install") or {}
+    for hint in ai.get("paths", []) or []:
+        p = Path(_expand(str(hint)))
+        if p.is_file():
+            return str(p)
+    # check the SwarmForge-managed bin dir (defaults.bin_dir)
+    custom = provider.get("_bin_dir") or provider.get("bin_dir") or \
+        provider.get("defaults", {}).get("bin_dir")
+    root = Path(custom) if custom else bin_dir({"defaults": {}})
+    name_key = provider.get("name") or name
+    if root.exists():
+        # 1) provider subdir shims: <bin>/<provider>/<binary>.{cmd,exe,...}
+        for cand in _bin_candidates(provider):
+            for p in list((root / name_key).glob(cand)):
+                if p.is_file():
+                    return str(p)
+        # 2) shallow files in bin root
+        for cand in _bin_candidates(provider):
+            for p in list(root.glob(cand)):
+                if p.is_file():
+                    return str(p)
+        # 3) deep fallback
+        for cand in _bin_candidates(provider):
+            for p in root.rglob(cand):
+                if p.is_file():
+                    return str(p)
+    return None
+
+
+def auto_install(name: str, provider: dict, quiet: bool = False) -> str | None:
+    """Install a missing CLI companion for the given provider. Returns the binary path.
+
+    Methods supported: npm (package), pwsh (PowerShell command), curl (shell script).
+    """
+    ai = provider.get("auto_install")
+    if not ai:
+        return None
+    method = ai.get("method")
+    root = Path(provider.get("_bin_dir") or
+                str(bin_dir(provider.get("defaults", {}))))
+    if method == "npm":
+        pkg = ai.get("package") or name
+        target = root / name
+        target.mkdir(parents=True, exist_ok=True)
+        cmd = ["npm", "install", "-g", f"--prefix={target}", pkg]
+        if not quiet:
+            print(f"  [install] {name} via npm: {pkg}")
+            print(f"           into {target}")
+        proc = _run_install(cmd)
+    elif method == "pwsh":
+        script = ai.get("command")
+        if not script:
+            return None
+        if not quiet:
+            print(f"  [install] {name} via PowerShell installer")
+        proc = _run_install(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", script])
+    elif method == "curl":
+        script = ai.get("command")
+        if not script:
+            return None
+        if not quiet:
+            print(f"  [install] {name} via install script")
+        proc = _run_install([script], shell=True)
+    else:
+        return None
+    if proc is None or proc.returncode != 0:
+        if not quiet:
+            print(f"  [x] install failed ({name})")
+        return None
+    return resolve_binary(name, provider)
+
+
+def _run_install(cmd, shell: bool = False):
+    try:
+        return subprocess.run(cmd, shell=shell, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=900)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# --------------------------------------------------------------------------
 # Agent invocation
 # --------------------------------------------------------------------------
 
 def build_command(provider: dict, prompt: str, model: str | None = None) -> list:
     cmd = list(provider.get("command", []))
+    if provider.get("path"):
+        cmd[0] = provider["path"]
     if provider.get("approve", True):
         cmd += list(provider.get("approve_flags", []))
     model_flag = provider.get("model_flag", [])
@@ -1034,29 +1263,54 @@ def continue_pipeline(cfg, avail, workspace, args, timeout, ledger=None, models=
 
 def check_report(cfg, det):
     print("\nSwarmForge - tool check\n")
+    desktop = desktop_apps()
     for name, p in det.items():
         if p["available"]:
             print(f"  [ok]  {name:<10s} -> {p['path']}")
         else:
+            app = p.get("desktop_app")
+            if app:
+                print(f"  [!]   {name:<10s} desktop app found ({app})")
+                print(f"         CLI companion missing - will auto-install on demand")
+            else:
+                print(f"  [x]   {name:<10s} not installed")
             cmd = install_commands(p)
-            extra = f"\n         install: {cmd}" if cmd else ""
-            print(f"  [x]   {name:<10s} missing{extra}")
+            if cmd and not p.get("auto_install"):
+                print(f"         install: {cmd}")
     missing = [n for n, p in det.items() if not p["available"]]
-    if missing:
+    auto = [n for n in missing if det[n].get("auto_install")]
+    if auto:
+        print(f"\nAuto-installable: {', '.join(auto)}")
+        print("  1) swarmforge --install   (interactive)")
+        print("  2) swarmforge --auto-install  (one-shot, installs all missing)")
+    elif missing:
         print("\nInstall karne ke liye: swarmforge --install")
     else:
         print("\nSab available. Chalo: swarmforge \"<task>\"")
 
 
-def interactive_install(det):
+def interactive_install(det, cfg):
     missing = [n for n, p in det.items() if not p["available"]]
     if not missing:
         print("Sab tools available hain - kuch install karne ki zaroorat nahi.")
         return
     for name in missing:
         p = det[name]
-        cmd = install_commands(p)
         print(f"\n[{name}]")
+        ai = p.get("auto_install")
+        if ai:
+            ans = input("  Auto-install CLI companion? (y/n): ").strip().lower()
+            if ans == "y":
+                path = auto_install(name, p)
+                if path:
+                    print(f"  [ok] {name} -> {path}")
+                else:
+                    print(f"  [x] {name} auto-install failed.")
+                    cmd = install_commands(p)
+                    if cmd:
+                        print(f"      Manual: {cmd}")
+            continue
+        cmd = install_commands(p)
         if cmd:
             print(f"  install: {cmd}")
         ans = input(f"  Install {name}? (y/n): ").strip().lower()
@@ -1064,6 +1318,31 @@ def interactive_install(det):
             print(f"  Running: {cmd}")
             subprocess.run(cmd, shell=True, check=False)
     print("\nInstall done. Naya terminal kholo ya phir se detect karo: swarmforge --check")
+
+
+def auto_install_missing(det, cfg):
+    """One-shot: install every missing provider that supports auto-install."""
+    missing = [n for n, p in det.items() if not p["available"]]
+    if not missing:
+        print("Sab tools available hain.")
+        return True
+    ok = True
+    for name in missing:
+        p = det[name]
+        ai = p.get("auto_install")
+        if not ai:
+            print(f"\n[{name}] no auto-install recipe - manual install kar lo.")
+            ok = False
+            continue
+        print(f"\n[{name}]")
+        path = auto_install(name, p)
+        if path:
+            print(f"  [ok] {name} -> {path}")
+        else:
+            print(f"  [x] {name} auto-install failed.")
+            ok = False
+    print("\nAuto-install complete.")
+    return ok
 
 
 def dry_run(cfg, det, task, models=None):
@@ -1103,6 +1382,8 @@ def main(argv=None):
     ap.add_argument("--dir", help="Workspace directory (default: runs/<slug>-<timestamp>)")
     ap.add_argument("--check", action="store_true", help="Detect installed tools and exit")
     ap.add_argument("--install", action="store_true", help="Interactively install missing tools")
+    ap.add_argument("--auto-install", action="store_true",
+                    help="Auto-install missing CLI companions (desktop apps pehle detect hote hain)")
     ap.add_argument("--dry-run", action="store_true", help="Preview what would run, without executing")
     ap.add_argument("--quick", action="store_true", help="Single agent, whole task, no plan/review")
     ap.add_argument("--no-plan", action="store_true", help="Skip planning (whole task = one subtask)")
@@ -1167,8 +1448,13 @@ def main(argv=None):
     if args.stats:
         render_usage(cfg, det, ledger)
         return 0
+    if args.auto_install:
+        auto_install_missing(det, cfg)
+        det = detect(cfg)
+        check_report(cfg, det)
+        return 0
     if args.install:
-        interactive_install(det)
+        interactive_install(det, cfg)
         return 0
 
     avail = available_providers(det)
@@ -1177,9 +1463,20 @@ def main(argv=None):
         for name, used, limit in exhausted:
             print(f"  [x]   {name}: daily quota exhausted ({used:,}/{limit:,} tokens) - skipping.")
     if not avail:
-        print("[x] Koi bhi AI CLI install nahi hai.")
-        print("    Check: swarmforge --check | Install: swarmforge --install")
-        return 1
+        # Zero-setup path: desktop app installed => auto-install its CLI companion.
+        autoable = {n: p for n, p in det.items()
+                    if not p["available"] and p.get("auto_install")}
+        if autoable:
+            print("[i] Koi CLI nahi mila - desktop apps detect kiye, CLI companions "
+                  "auto-install ho rahe hain...")
+            auto_install_missing(det, cfg)
+            det = detect(cfg)
+            avail = available_providers(det)
+            avail, exhausted = filter_quota(cfg, avail, ledger)
+        if not avail:
+            print("[x] Koi bhi AI CLI install nahi hai.")
+            print("    Check: swarmforge --check | Install: swarmforge --install")
+            return 1
 
     if args.dry_run:
         dry_run(cfg, det, " ".join(args.task), models)

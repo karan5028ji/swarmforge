@@ -8,8 +8,11 @@ import sys
 sys.path.insert(0, str(ROOT))
 
 from swarmforge import (  # noqa: E402
+    bin_dir,
     build_command,
     build_phase,
+    desktop_apps,
+    detect,
     estimate_tokens,
     extract_json_array,
     filter_quota,
@@ -21,6 +24,8 @@ from swarmforge import (  # noqa: E402
     pick_provider,
     record_usage,
     render_usage,
+    resolve_binary,
+    save_settings,
     usage_path,
 )
 
@@ -314,6 +319,80 @@ class TestScaffold(unittest.TestCase):
             plan = json.loads((ws / "memory" / "plan.json").read_text(encoding="utf-8"))
             self.assertEqual(plan[0]["role"], "scaffolder")
             self.assertEqual(len(plan), 2)
+
+
+class TestAutoInstall(unittest.TestCase):
+    def test_bin_dir_default(self):
+        cfg = {"defaults": {}}
+        bd = bin_dir(cfg)
+        self.assertTrue(str(bd).endswith(("swarmforge", "swarmforge/bin")) or
+                        "swarmforge" in str(bd))
+
+    def test_bin_dir_custom(self):
+        cfg = {"defaults": {"bin_dir": "C:/my/custom/bin"}}
+        self.assertEqual(bin_dir(cfg).as_posix(), "C:/my/custom/bin")
+
+    def test_resolve_binary_from_bin_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            bd = tmp / "bin"
+            bd.mkdir()
+            fake = bd / "opencode.exe"
+            fake.write_bytes(b"")
+            provider = {"binary": "opencode",
+                        "auto_install": {"binary": "opencode", "paths": []}}
+            cfg = {"defaults": {"bin_dir": str(bd)}}
+            import swarmforge
+            old = swarmforge.bin_dir
+            swarmforge.bin_dir = lambda cfg: bd
+            try:
+                got = resolve_binary("opencode", provider)
+            finally:
+                swarmforge.bin_dir = old
+            self.assertEqual(got, str(fake))
+
+    def test_resolve_binary_override_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            custom = tmp / "custom" / "opencode.exe"
+            custom.parent.mkdir()
+            custom.write_bytes(b"")
+            provider = {"binary": "opencode", "binary_path": str(custom)}
+            self.assertEqual(resolve_binary("opencode", provider), str(custom))
+
+    def test_build_command_uses_resolved_path(self):
+        provider = {"command": ["opencode", "run"], "path": "C:/x/opencode.exe",
+                    "approve_flags": []}
+        cmd = build_command(provider, "hello")
+        self.assertEqual(cmd, ["C:/x/opencode.exe", "run", "hello"])
+
+    def test_desktop_apps_returns_dict(self):
+        self.assertIsInstance(desktop_apps(), dict)
+
+    def test_detect_reports_desktop_app_key(self):
+        det = detect(load_config(str(ROOT / "tests" / "test-config.json")))
+        for name, info in det.items():
+            self.assertIn("desktop_app", info)
+            self.assertIn("available", info)
+            self.assertIn("path", info)
+
+    def test_save_and_merge_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            base = _write_temp_config(tmp)
+            save_settings(base, {"mocka": {"binary_path": "C:/x/mocka.exe"}},
+                          {"bin_dir": "C:/bin"})
+            cfg = load_config(str(base))
+            self.assertEqual(cfg["providers"]["mocka"]["binary_path"], "C:/x/mocka.exe")
+            self.assertEqual(cfg["defaults"]["bin_dir"], "C:/bin")
+            self.assertTrue(base.with_name("swarmforge-settings.json").exists())
+
+    def test_main_auto_install_flag_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            rc = main(["--auto-install",
+                       "--config", str(ROOT / "tests" / "test-config.json")])
+            self.assertEqual(rc, 0)
 
 
 class TestGui(unittest.TestCase):
