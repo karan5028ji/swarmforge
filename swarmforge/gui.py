@@ -34,6 +34,7 @@ from swarmforge import (  # noqa: E402
     load_config,
     load_usage,
     main as cli_main,
+    register_global_approver,
     resolve_binary,
     total_cost_saved,
 )
@@ -72,12 +73,14 @@ class App(tk.Tk):
         self.cfg_path = cfg_path
         self.workspace = None
         self.log_q = queue.Queue()
+        self._approval_win = None
         self._build_style()
         self._build_ui()
         self.refresh()
         if cfg_path:
             self.cfg_var.set(cfg_path)
         self.check_tools()
+        register_global_approver(self._hitl_approver)
 
     # ------------------------------------------------------------- theme
     def _build_style(self):
@@ -165,10 +168,12 @@ class App(tk.Tk):
         self.scaffold_var = tk.BooleanVar()
         self.no_plan_var = tk.BooleanVar()
         self.no_review_var = tk.BooleanVar()
+        self.hitl_var = tk.BooleanVar()
         ttk.Checkbutton(row2, text="Quick", variable=self.quick_var).pack(side="left")
         ttk.Checkbutton(row2, text="Scaffold", variable=self.scaffold_var).pack(side="left", padx=8)
         ttk.Checkbutton(row2, text="No plan", variable=self.no_plan_var).pack(side="left", padx=8)
         ttk.Checkbutton(row2, text="No review", variable=self.no_review_var).pack(side="left", padx=8)
+        ttk.Checkbutton(row2, text="HITL", variable=self.hitl_var).pack(side="left", padx=8)
         ttk.Label(row2, text="Models (role=model; ...)").pack(side="left", padx=(16, 4))
         self.model_var = tk.StringVar()
         ttk.Entry(row2, textvariable=self.model_var, width=26).pack(side="left")
@@ -409,6 +414,8 @@ class App(tk.Tk):
             argv.append("--no-plan")
         if self.no_review_var.get():
             argv.append("--no-review")
+        if self.hitl_var.get():
+            argv.append("--hitl")
         cfg = self.cfg_var.get().strip()
         if cfg:
             argv += ["--config", cfg]
@@ -462,6 +469,58 @@ class App(tk.Tk):
                                        text="Done" if rc == 0 else "Run failed")))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _hitl_approver(self, issues, gate):
+        """Called from the pipeline thread when human approval is needed."""
+        self.after(0, lambda: self._show_approval_dialog(issues, gate))
+
+    def _show_approval_dialog(self, issues, gate):
+        if self._approval_win is not None and self._approval_win.winfo_exists():
+            self._approval_win.lift()
+            return
+        win = tk.Toplevel(self)
+        self._approval_win = win
+        win.title("SwarmForge — approve auto-fix?")
+        win.configure(bg=BG)
+        win.geometry("560x360")
+        win.transient(self)
+        win.grab_set()
+        ttk.Label(win, text=f"Reviewer found {len(issues)} issue(s). Proceed with Auto-Fix?",
+                  style="Accent.TLabel", background=BG, foreground=GREEN).pack(
+            anchor="w", padx=16, pady=(14, 8))
+        box = tk.Frame(win, bg=PANEL)
+        box.pack(fill="both", expand=True, padx=16, pady=4)
+        lst = tk.Listbox(box, bg=PANEL, fg=FG, relief="flat", selectbackground=ACCENT,
+                         font=("Consolas", 9))
+        scroll = ttk.Scrollbar(box, orient="vertical", command=lst.yview)
+        lst.configure(yscrollcommand=scroll.set)
+        lst.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        for i in issues[:30]:
+            sev = i.get("severity", "?")
+            path = i.get("path", "?")
+            prob = (i.get("problem", "") or "")[:160]
+            lst.insert("end", f"[{sev}] {path}: {prob}")
+        if len(issues) > 30:
+            lst.insert("end", f"... and {len(issues) - 30} more")
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=16, pady=(10, 14))
+        ttk.Button(btns, text="Approve Fix", style="Accent.TButton",
+                   command=lambda: self._decide_approval(gate, "fix")).pack(side="left")
+        ttk.Button(btns, text="Skip Fixes",
+                   command=lambda: self._decide_approval(gate, "skip")).pack(side="left", padx=8)
+        ttk.Button(btns, text="Decline (review again)",
+                   command=lambda: self._decide_approval(gate, "no")).pack(side="left")
+        win.protocol("WM_DELETE_WINDOW", lambda: self._decide_approval(gate, "skip"))
+        win.focus_force()
+
+    def _decide_approval(self, gate, decision):
+        try:
+            gate.decide(decision)
+        finally:
+            if self._approval_win is not None and self._approval_win.winfo_exists():
+                self._approval_win.destroy()
+            self._approval_win = None
 
     def open_workspace(self):
         path = self.dir_var.get().strip() or self.workspace

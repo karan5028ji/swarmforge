@@ -26,10 +26,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.parse as _urllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 CONFIG_NAME = "agents.json"
 
 # --------------------------------------------------------------------------
@@ -842,6 +843,106 @@ class LiveStatus:
 
 
 # --------------------------------------------------------------------------
+# Human-in-the-loop approval (CLI pause loop / GUI modal / web dashboard)
+# --------------------------------------------------------------------------
+
+class ApprovalGate:
+    """Cross-surface approval primitive.
+
+    The pipeline thread calls request() then blocks on wait(); whichever
+    surface is attached (CLI input, GUI modal, web /approve button) calls
+    decide() to release it.
+    """
+
+    def __init__(self):
+        self._evt = threading.Event()
+        self._lock = threading.Lock()
+        self._decision = None
+        self.issues = []
+
+    def request(self, issues):
+        with self._lock:
+            self.issues = list(issues)
+            self._decision = None
+        self._evt.clear()
+
+    def decide(self, decision: str):
+        with self._lock:
+            self._decision = decision
+        self._evt.set()
+
+    def wait(self, timeout: float | None = None) -> str | None:
+        self._evt.wait(timeout)
+        with self._lock:
+            return self._decision
+
+
+_GATES: dict = {}
+_APPROVERS: dict = {}
+_GLOBAL_APPROVER = None
+
+
+def get_gate(workspace: str) -> ApprovalGate:
+    gate = _GATES.get(workspace)
+    if gate is None:
+        gate = _GATES[workspace] = ApprovalGate()
+    return gate
+
+
+def register_approver(workspace: str, fn):
+    """Attach a surface-specific approver (web) for a workspace."""
+    _APPROVERS[workspace] = fn
+
+
+def register_global_approver(fn):
+    """Attach an approver that applies to every workspace (GUI)."""
+    global _GLOBAL_APPROVER
+    _GLOBAL_APPROVER = fn
+
+
+def clear_approval_registry():
+    """Test helper: forget all gates/approvers."""
+    global _GLOBAL_APPROVER
+    _GATES.clear()
+    _APPROVERS.clear()
+    _GLOBAL_APPROVER = None
+
+
+def _cli_approval_prompt(issues) -> str:
+    print(f"\n[SwarmForge] Reviewer found {len(issues)} issue(s).")
+    for i in issues[:5]:
+        print(f"  [{i.get('severity','?')}] {i.get('path','?')}: "
+              f"{i.get('problem','')[:120]}")
+    if len(issues) > 5:
+        print(f"  ... and {len(issues) - 5} more")
+    ans = input("Proceed with Auto-Fix? [y/n/skip] ").strip().lower()
+    if ans in ("y", "yes", "fix", "approve", "approve fix"):
+        return "fix"
+    if ans in ("s", "skip"):
+        return "skip"
+    return "no"
+
+
+def hitl_approval(issues: list, status: LiveStatus, workspace: str) -> str:
+    """Block until a human decides on the auto-fix. Returns 'fix' | 'no' | 'skip'."""
+    gate = get_gate(workspace)
+    status.set(phase="awaiting_approval",
+               approval={"state": "pending", "issues": issues})
+    status.log(f"HITL: AWAITING_APPROVAL - reviewer found {len(issues)} issue(s)")
+    gate.request(issues)
+    approver = _APPROVERS.get(workspace) or _GLOBAL_APPROVER
+    if approver:
+        approver(issues, gate)  # GUI modal or web: decides via gate.decide()
+    else:
+        gate.decide(_cli_approval_prompt(issues))
+    decision = gate.wait() or "skip"
+    status.set(phase="fixing" if decision == "fix" else "review",
+               approval={"state": decision})
+    status.log(f"HITL: decision = {decision}")
+    return decision
+
+
+# --------------------------------------------------------------------------
 # Phases
 # --------------------------------------------------------------------------
 
@@ -913,7 +1014,7 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
 
 
 def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
-                    models=None):
+                    models=None, hitl=False, workspace=None):
     issues = []
     models = models or {}
     for round_no in range(1, 3):
@@ -933,6 +1034,16 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
             status.log("review clean")
             break
         status.log(f"review found {len(issues)} issue(s)")
+        if hitl and workspace:
+            decision = hitl_approval(issues, status, workspace)
+            if decision == "skip":
+                status.log("HITL: human skipped fixes - stopping review loop")
+                break
+            if decision != "fix":
+                status.log("HITL: human declined auto-fix - next review round")
+                if round_no == 2:
+                    break
+                continue
         fname = pick_provider("fixer", avail, used, cfg)
         f = avail[fname]
         fprompt = role_prompt(
@@ -1099,11 +1210,24 @@ DASHBOARD_HTML = """<!doctype html>
   #logs{background:#0a0c11;border:1px solid #1f2430;border-radius:8px;padding:12px;font-size:12px;height:220px;overflow:auto;white-space:pre-wrap}
   .files a{color:#60a5fa;text-decoration:none}
   h2{color:#8b5cf6;font-size:14px;margin:20px 0 8px}
+  #approval{display:none;border:1px solid #f59e0b;background:#2a2007;border-radius:8px;padding:14px 16px;margin:16px 0}
+  #approval.pending{display:block}
+  #approval .title{color:#fbbf24;font-weight:700;font-size:14px;margin-bottom:8px}
+  #approval ul{margin:8px 0 12px;padding-left:20px;font-size:12px;color:#e5e7eb}
+  .abtn{border:0;border-radius:6px;padding:8px 18px;margin-right:10px;font-size:13px;font-weight:600;cursor:pointer}
+  .abtn.fix{background:#4ade80;color:#052e16}
+  .abtn.skip{background:#1f2430;color:#d7dae0;border:1px solid #3a4152}
 </style>
 </head>
 <body>
 <h1>SwarmForge</h1>
 <div class="sub">multi-agent build in progress — <span id="phase">...</span></div>
+<div id="approval">
+  <div class="title">Reviewer found issues — approve auto-fix?</div>
+  <div id="approval-issues"></div>
+  <button class="abtn fix" onclick="decide('fix')">Approve Fix</button>
+  <button class="abtn skip" onclick="decide('skip')">Skip Fixes</button>
+</div>
 <div><span class="saved">Estimated API cost saved: <span id="saved">$0.00</span> (free-tier)</span></div>
 <table>
   <thead><tr><th>provider</th></tr></thead>
@@ -1123,10 +1247,17 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="logs"></div>
 <script>
 function esc(s){return (s||'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function decide(d){fetch('/approve?decision='+d);document.getElementById('approval').className='';}
 async function poll(){
   try{
     const r=await fetch('/status.json');const s=await r.json();
     document.getElementById('phase').textContent=s.phase||'';
+    const ap=document.getElementById('approval');
+    if(s.approval&&s.approval.state==='pending'){
+      ap.className='pending';
+      document.getElementById('approval-issues').innerHTML='<ul>'+(s.approval.issues||[]).map(i=>
+        '<li>['+esc(i.severity||'?')+'] '+esc(i.path||'?')+': '+esc((i.problem||'').slice(0,140))+'</li>').join('')+'</ul>';
+    }else{ap.className='';}
     document.getElementById('providers').innerHTML=(s.providers||[]).map(p=>'<tr><td>'+esc(p)+'</td></tr>').join('');
     document.getElementById('agents').innerHTML=(s.agents||[]).map(a=>
       '<tr><td>'+esc(a.id)+'</td><td>'+esc(a.provider)+'</td><td>'+
@@ -1197,6 +1328,13 @@ def serve(workspace: str, port: int, cfg: dict | None = None):
                     sp = root / "status.json"
                     data = sp.read_bytes() if sp.exists() else b"{}"
                     self._send(data, "application/json")
+                elif path == "/approve":
+                    q = _urllib.parse_qs(_urllib.urlparse(self.path).query)
+                    decision = (q.get("decision") or ["fix"])[0]
+                    if decision not in ("fix", "skip", "no"):
+                        decision = "fix"
+                    get_gate(str(root)).decide(decision)
+                    self._send(b'{"ok": true}', "application/json")
                 elif path == "/usage.json":
                     self._send(json.dumps({"rows": usage_rows()}).encode("utf-8"),
                                "application/json")
@@ -1217,6 +1355,11 @@ def serve(workspace: str, port: int, cfg: dict | None = None):
     except OSError as e:
         print(f"[serve] Port {port} busy: {e}")
         return
+
+    def _web_approver(issues, gate):
+        pass  # the browser decides via GET /approve?decision=...
+
+    register_approver(str(root), _web_approver)
     print(f"[serve] Dashboard: http://127.0.0.1:{port}")
     print(f"[serve] Output files: http://127.0.0.1:{port}/out/  (live)")
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1289,7 +1432,8 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
     if not (args.quick or args.no_review):
         status.set(phase="reviewing")
         issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout,
-                                 status, models)
+                                 status, models, getattr(args, "hitl", False),
+                                 workspace)
 
     # 4. REPORT ------------------------------------------------------------
     status.set(phase="reporting")
@@ -1321,7 +1465,8 @@ def continue_pipeline(cfg, avail, workspace, args, timeout, ledger=None, models=
     issues = []
     if not args.no_review:
         issues = review_fix_loop(cfg, avail, used, task, shared, outroot, timeout,
-                                 status, models)
+                                 status, models, getattr(args, "hitl", False),
+                                 workspace)
     write_report(ws, task, plan, results, issues, outroot, cfg)
     record_run_usage(cfg, ledger, results)
     status.set(phase="done")
@@ -1461,6 +1606,8 @@ def main(argv=None):
     ap.add_argument("--quick", action="store_true", help="Single agent, whole task, no plan/review")
     ap.add_argument("--no-plan", action="store_true", help="Skip planning (whole task = one subtask)")
     ap.add_argument("--no-review", action="store_true", help="Skip review/fix loop")
+    ap.add_argument("--hitl", "--interactive", action="store_true",
+                    help="Human-in-the-loop: pause before auto-fixes and ask for approval")
     ap.add_argument("--continue", dest="cont", action="store_true",
                     help="Resume an existing workspace (review + re-report), needs --dir")
     ap.add_argument("--serve", nargs="?", const=8787, type=int, metavar="PORT",

@@ -2,15 +2,18 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(ROOT))
 
 from swarmforge import (  # noqa: E402
+    ApprovalGate,
     bin_dir,
     build_command,
     build_phase,
+    clear_approval_registry,
     cost_rate,
     desktop_apps,
     detect,
@@ -19,6 +22,8 @@ from swarmforge import (  # noqa: E402
     extract_json_array,
     filter_quota,
     format_cost,
+    get_gate,
+    hitl_approval,
     load_usage,
     load_config,
     main,
@@ -26,6 +31,7 @@ from swarmforge import (  # noqa: E402
     parse_subtasks,
     pick_provider,
     record_usage,
+    register_global_approver,
     render_usage,
     resolve_binary,
     save_settings,
@@ -176,6 +182,108 @@ class TestEndToEnd(unittest.TestCase):
                        "--dir", str(ws)])
             self.assertEqual(rc, 0)
             self.assertTrue((ws / "REPORT.md").exists())
+
+
+class TestHitl(unittest.TestCase):
+    def setUp(self):
+        clear_approval_registry()
+
+    def tearDown(self):
+        clear_approval_registry()
+
+    def test_approval_gate_primitive(self):
+        gate = ApprovalGate()
+        gate.request([{"severity": "low", "path": "a.py", "problem": "x"}])
+        gate.decide("fix")
+        self.assertEqual(gate.wait(), "fix")
+        gate.request([])
+        self.assertIsNone(gate.wait(0.01))
+        gate.decide("skip")
+        self.assertEqual(gate.wait(), "skip")
+
+    def test_get_gate_singleton_per_workspace(self):
+        self.assertIs(get_gate("ws-a"), get_gate("ws-a"))
+        self.assertIsNot(get_gate("ws-a"), get_gate("ws-b"))
+
+    def test_hitl_approval_cli_prompt_approve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from swarmforge import LiveStatus
+            status = LiveStatus(tmp)
+            with mock.patch("builtins.input", return_value="y"):
+                self.assertEqual(
+                    hitl_approval([{"severity": "low", "path": "a.py",
+                                    "problem": "validate input"}],
+                                  status, str(Path(tmp) / "ws")), "fix")
+            state = json.loads((Path(tmp) / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "fixing")
+            self.assertEqual(state["approval"]["state"], "fix")
+
+    def test_hitl_approval_cli_prompt_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from swarmforge import LiveStatus
+            status = LiveStatus(tmp)
+            with mock.patch("builtins.input", return_value="skip"):
+                decision = hitl_approval(
+                    [{"severity": "low", "path": "a.py", "problem": "x"}],
+                    status, str(Path(tmp) / "ws"))
+            self.assertEqual(decision, "skip")
+            state = json.loads((Path(tmp) / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["approval"]["state"], "skip")
+
+    def test_hitl_approval_uses_registered_approver(self):
+        decided = []
+        with tempfile.TemporaryDirectory() as tmp:
+            from swarmforge import LiveStatus
+            status = LiveStatus(tmp)
+
+            def approver(issues, gate):
+                decided.append(issues)
+                gate.decide("fix")
+
+            register_global_approver(approver)
+            with mock.patch("builtins.input", side_effect=AssertionError("no cli prompt")):
+                decision = hitl_approval(
+                    [{"severity": "high", "path": "b.py", "problem": "bug"}],
+                    status, str(Path(tmp) / "ws"))
+            self.assertEqual(decision, "fix")
+            self.assertEqual(len(decided), 1)
+            self.assertEqual(decided[0][0]["severity"], "high")
+
+    def test_pipeline_hitl_approve_runs_fixer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            register_global_approver(lambda issues, gate: gate.decide("fix"))
+            rc = main(["Build a todo web app", "--hitl",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            self.assertTrue((ws / "memory" / "review_1.json").exists())
+            self.assertTrue((ws / "memory" / "review_2.json").exists())
+            status = json.loads((ws / "status.json").read_text(encoding="utf-8"))
+            self.assertIn("AWAITING_APPROVAL", "\n".join(status["logs"]))
+
+    def test_pipeline_hitl_skip_stops_fixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            register_global_approver(lambda issues, gate: gate.decide("skip"))
+            rc = main(["Build a todo web app", "--hitl",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
+            self.assertTrue((ws / "memory" / "review_1.json").exists())
+            self.assertFalse((ws / "memory" / "review_2.json").exists())
+            status = json.loads((ws / "status.json").read_text(encoding="utf-8"))
+            logs = "\n".join(status["logs"])
+            self.assertIn("human skipped fixes", logs)
+
+    def test_main_accepts_interactive_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            register_global_approver(lambda issues, gate: gate.decide("skip"))
+            rc = main(["Build a todo web app", "--interactive",
+                       "--config", str(ROOT / "tests" / "test-config.json"),
+                       "--dir", str(ws)])
+            self.assertEqual(rc, 0)
 
 
 class TestDag(unittest.TestCase):

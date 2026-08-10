@@ -134,6 +134,9 @@ python forge.py "..." --no-plan
 # Skip review/fix
 python forge.py "..." --no-review
 
+# Human-in-the-loop: pause before auto-fixes and ask for approval
+python forge.py "..." --hitl          # alias: --interactive
+
 # Preview what would run, without executing anything
 python forge.py "..." --dry-run
 
@@ -258,6 +261,25 @@ in `DEPENDENCY OUTPUTS`). With `--scaffold`, a `scaffold` task is inserted first
 other subtask depends on it, so the whole swarm builds inside one shared project tree.
 
 The review/fix loop runs up to 2 rounds and stops as soon as a review is clean.
+
+### Human-in-the-loop approvals
+
+With `--hitl` (alias `--interactive`), the pipeline pauses when the reviewer reports issues
+and asks for permission before running the auto-fix. The approval gate works on every surface:
+
+- **CLI** — prints the issues and prompts `Proceed with Auto-Fix? [y/n/skip]`.
+- **GUI** — a modal dialog lists the issues with **Approve Fix** / **Skip Fixes** /
+  **Decline (review again)** buttons (enable the **HITL** checkbox).
+- **Web dashboard** (`--serve`) — the page shows the pending issues with
+  **Approve Fix** and **Skip Fixes** buttons (`/approve?decision=...`).
+
+Decisions:
+- `fix` — run the fixer, then a fresh review round (up to 2 total).
+- `skip` — stop the review/fix loop for this run.
+- `no` (decline) — skip this round's fixer but run another review round.
+
+While a decision is pending the dashboard shows `phase: awaiting_approval` and the state is
+recorded in `status.json` under `approval`.
 
 ## Project layout
 
