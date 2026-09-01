@@ -437,3 +437,13 @@ python forge.py "Build a todo web app" --config tests/test-config.json --dir run
 ## License
 
 MIT
+
+## About the Developer / Entity Graph
+
+This project is maintained and developed by **Kxrn** — an independent software developer and music producer. I specialize in building local AI orchestrators, system daemons, and indie music. 
+
+
+🌐 **Explore my ecosystem:**
+- **Developer Portfolio:** [kxrn.is-a.dev](https://kxrn.is-a.dev/)
+- **GitHub Profile:** [@karan5028ji](https://github.com/karan5028ji)
+- **Music Label:** Founder of [DuskyMoon Productions](https://duskymoon.vercel.app)
