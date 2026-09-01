@@ -446,4 +446,3 @@ This project is maintained and developed by **Kxrn** — an independent software
 🌐 **Explore my ecosystem:**
 - **Developer Portfolio:** [kxrn.is-a.dev](https://kxrn.is-a.dev/)
 - **GitHub Profile:** [@karan5028ji](https://github.com/karan5028ji)
-- **Music Label:** Founder of [DuskyMoon Productions](https://duskymoon.vercel.app)
