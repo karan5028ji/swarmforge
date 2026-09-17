@@ -30,34 +30,16 @@ coordinated workforce:
 
 ## 📸 Visual Proof
 
-> **📝 TODO — Drop your screenshots here.** Images live in `docs/screenshots/`. Replace the
-> `<img>` tags below (swap the `src`, keep the `alt`). The three shots below are the ones judges
-> remember.
-
-<!-- ============================================================
-     SCREENSHOT 1 — LIVE TAILWIND DASHBOARD
-     FILE:    docs/screenshots/dashboard.png
-     SHOW:    the live dashboard at 127.0.0.1:8787 —
-              glowing green "Estimated Cost Saved" banner on top,
-              agent cards with spinners for running agents,
-              pipeline visualizer (Plan ➔ ... ➔ Report) mid-build.
-     ============================================================ -->
+### 1. Real-Time Tailwind Web Dashboard (`--serve`)
+Real-time pipeline visualizer, live spinning agent status cards, and the glowing **Estimated Cost Saved** ROI banner calculated live.
 <img src="docs/screenshots/dashboard.png" alt="Live dashboard — cost-saved banner + parallel agent grid with spinners" width="900">
 
-<!-- ============================================================
-     SCREENSHOT 2 — HUMAN-IN-THE-LOOP APPROVAL (HITL)
-     FILE:    docs/screenshots/hitl.png
-     SHOW:    the HITL approval modal (or CLI prompt) where the run
-              pauses and asks Approve Fix / Skip Fixes before editing.
-     ============================================================ -->
+### 2. Enterprise Human-in-the-Loop Gate (`--hitl`)
+Automated QA reviewer detects potential defects; execution pauses for human verification before applying auto-fixes.
 <img src="docs/screenshots/hitl.png" alt="HITL approval gate — approve fix / skip fixes" width="900">
 
-<!-- ============================================================
-     SCREENSHOT 3 — RICH DIFFING IN REPORT.md
-     FILE:    docs/screenshots/diffing.png
-     SHOW:    the end of REPORT.md with the "📝 Code Changes" section —
-              Git-style red (-) / green (+) unified diff blocks.
-     ============================================================ -->
+### 3. Rich Code Changes & Unified Diff Engine (`REPORT.md`)
+Every run captures pre-build and post-fix AST snapshots, producing Git-style unified diffs directly in Markdown and JSON.
 <img src="docs/screenshots/diffing.png" alt="REPORT.md 📝 Code Changes — Git-style unified diff" width="900">
 
 ---

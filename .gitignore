@@ -37,3 +37,8 @@ desktop.ini
 # Secrets
 .env
 *.local
+
+# Internal submission & video briefs
+FREELANCER_VIDEO_BRIEF.md
+HACKATHON.md
+*.pdf
