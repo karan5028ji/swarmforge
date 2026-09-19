@@ -520,6 +520,11 @@ def build_command(provider: dict, prompt: str, model: str | None = None) -> list
     cmd = list(provider.get("command", []))
     if provider.get("path"):
         cmd[0] = provider["path"]
+    is_agy = provider.get("binary") == "agy" or (bool(cmd) and Path(cmd[0]).stem.lower() == "agy")
+    agy_p = False
+    if is_agy and "-p" in cmd:
+        cmd.remove("-p")
+        agy_p = True
     if provider.get("approve", True):
         cmd += list(provider.get("approve_flags", []))
     model_flag = provider.get("model_flag", [])
@@ -527,6 +532,8 @@ def build_command(provider: dict, prompt: str, model: str | None = None) -> list
         model = provider.get("model")
     if model and model_flag:
         cmd += list(model_flag) + [model]
+    if agy_p or provider.get("prompt_flag"):
+        cmd += ["-p"]
     cmd.append(prompt)
     return cmd
 
@@ -614,12 +621,16 @@ def role_prompt(cfg: dict, role: str, **kw) -> str:
 # Parsing helpers
 # --------------------------------------------------------------------------
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
 def _strip_fences(text: str) -> str:
     m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S)
     return m.group(1) if m else text
 
 
 def extract_json_array(text: str):
+    text = _ANSI_ESCAPE_RE.sub("", text)
     text = _strip_fences(text)
     start = text.find("[")
     end = text.rfind("]")
@@ -629,13 +640,17 @@ def extract_json_array(text: str):
 
 
 def parse_subtasks(text: str):
+    raw = extract_json_array(text)
+    if raw is None:
+        return None
     try:
-        raw = extract_json_array(text)
-        if raw is None:
-            return None
         data = json.loads(raw)
     except Exception:  # noqa: BLE001
-        return None
+        try:
+            raw_clean = re.sub(r",\s*([\]}])", r"\1", raw)
+            data = json.loads(raw_clean)
+        except Exception:  # noqa: BLE001
+            return None
     if not isinstance(data, list) or not data:
         return None
     out = []
@@ -656,13 +671,17 @@ def parse_subtasks(text: str):
 
 
 def parse_issues(text: str):
+    raw = extract_json_array(text)
+    if raw is None:
+        return []
     try:
-        raw = extract_json_array(text)
-        if raw is None:
-            return []
         data = json.loads(raw)
     except Exception:  # noqa: BLE001
-        return []
+        try:
+            raw_clean = re.sub(r",\s*([\]}])", r"\1", raw)
+            data = json.loads(raw_clean)
+        except Exception:  # noqa: BLE001
+            return []
     if not isinstance(data, list):
         return []
     return [x for x in data if isinstance(x, dict)]
@@ -971,7 +990,12 @@ def plan_phase(cfg, avail, used, task, shared, timeout, status, models=None):
     res = run_agent(p, prompt, shared, timeout, "planner", (models or {}).get("planner"))
     (shared / "planner.log").write_text(
         res["stdout"] + "\n--- stderr ---\n" + res["stderr"], encoding="utf-8")
-    return parse_subtasks(res["stdout"])
+    subtasks = parse_subtasks(res["stdout"])
+    if not subtasks and res.get("returncode") != 0:
+        err = res.get("stderr", "").strip() or res.get("stdout", "").strip()
+        first_line = err.splitlines()[0][:140] if err else f"exit code {res.get('returncode')}"
+        print(f"  [warn] Planner ({pname}) process returned exit code {res.get('returncode')}: {first_line}")
+    return subtasks
 
 
 def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
